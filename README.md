@@ -28,7 +28,10 @@ De standaardinstellingen zijn **gebacktest en getoetst buiten de trainingsdata**
 | **BUY / SELL** | Bevestigd signaal + trendscore (bv. `+5/6`) |
 | **Rode stoplijn** | Start op 2× ATR en schuift mee op 3× ATR van de hoogste high (long) of laagste low (short) |
 | **EXIT +x%** | Positie gesloten door de stop, met resultaat |
-| **Dashboard** | Trend, score, ADX, DI+/DI−, EMA's, volume, RSI, HTF-trend, laatste signaal + hit-rate, open positie |
+| **Oranje bol onder candle** | Long-liquidatiegolf (longs gedwongen gesloten). Grotere bol = heftiger |
+| **Blauwe bol boven candle** | Short-liquidatiegolf (short squeeze) |
+| **Oranje/blauwe lijnen** | Geschatte liquidatieniveaus van 25×/50×/100× posities. Dikker = lagere hefboom. Verdwijnen zodra de koers ze raakt |
+| **Dashboard** | Trend, score, ADX, DI+/DI−, EMA's, volume, RSI, HTF-trend, laatste signaal + hit-rate, open positie, open interest 24u, laatste liquidatiegolf, dichtstbijzijnde liq-niveaus |
 
 ## Signaallogica
 
@@ -44,6 +47,32 @@ De standaardinstellingen zijn **gebacktest en getoetst buiten de trainingsdata**
 **SELL** is het spiegelbeeld. Een tegengesteld signaal draait de positie om.
 
 **Trendscore (−6 … +6):** koers vs EMA 50, EMA 9 vs 21, EMA 50 vs 200, DI+ vs DI−, RSI vs 50 en de HTF-trend tellen elk ±1.
+
+## Liquidaties
+
+Echte liquidatiedata is in Pine Script niet beschikbaar. TradingView levert voor crypto-perps wel **open interest** (`…USDT.P_OI`), en daar is de indicator op gebaseerd.
+
+**1. Liquidatiegolven (bollen).** Bij liquidaties worden posities gedwongen gesloten, waardoor de open interest abnormaal snel daalt. Een daling van ≥ 2 standaardafwijkingen met een rode candle betekent dat longs geliquideerd zijn (oranje). Bij een groene candle zijn shorts geliquideerd (blauw).
+
+*Gevalideerd* tegen ruim 24.000 echte liquidatieorders van OKX (24 uur, 5m, BTC/ETH/SOL/HYPE):
+- correlatie tussen OI-daling en geliquideerd volume: −0,46 (BTC), −0,71 (ETH), −0,51 (SOL), −0,29 (HYPE)
+- 59% van de gedetecteerde golven valt in de 10% zwaarste liquidatiebars (toeval: 10%)
+- de richting (longs of shorts) klopt in **85%** van de gevallen
+
+**2. Geschatte liquidatieniveaus (lijnen).** Vanaf candles met hoog volume (≥ 1,5× het gemiddelde) wordt berekend waar 25×, 50× en 100× posities geliquideerd worden: `entry × (1 ∓ 1/hefboom ± onderhoudsmarge)`. Raakt de koers een niveau, dan verdwijnt het. Niveaus die nog niet geraakt zijn, werken vaak als magneet. Dit is een **schatting**; echte posities en hefbomen zijn onbekend.
+
+**Open interest-symbool.** Dit wordt automatisch gekozen (de perp op dezelfde exchange, bv. `BINANCE:BTCUSDT.P_OI`). Staat je chart op een exchange zonder perps (bv. Coinbase), vul dan bij *Liquidaties → Open-interest symbool* bijvoorbeeld `BINANCE:BTCUSDT.P_OI` in. Toont het dashboard "n.v.t.", dan is er geen OI-data voor dat symbool.
+
+**Wat zegt het over de koers?** Event-studie op 4H, mrt–nov 2026, 4 munten:
+
+| Na een… | n | +24u positief | +48u positief |
+|---|---|---|---|
+| Long-liquidatiegolf **in uptrend** (boven EMA 200) | 33 | 61% | 64% |
+| Long-liquidatiegolf in downtrend | 60 | 47% | **28%** |
+| Short squeeze in uptrend | 34 | 44% (+4u: 35%) | 50% |
+| Basis (alle bars) | 5.625 | 50% | 48% |
+
+Lees dit als *context*, niet als signaal: in een uptrend is een long-flush vaak een koopkans, in een downtrend zet de daling meestal door, en na een short squeeze kun je beter niet direct kopen. De aantallen zijn te klein om er een filter op te bouwen. Daarom **veranderen liquidaties de BUY/SELL-signalen niet**. Er zijn wel aparte alerts voor (*Long-liquidaties* / *Short-liquidaties*).
 
 ## Backtest
 
@@ -85,6 +114,12 @@ python3 fetch.py          # haalt OKX-candles op naar backtest/data/
 python3 grid.py 4H        # grid search (ook: 1H, 15m)
 python3 analyze.py 4H 6   # top-configs met train/test-resultaten
 python3 stress.py         # gevoeligheid + resultaten per jaar
+
+# liquidaties
+python3 fetch_oi.py && python3 fetch_liq.py
+python3 validate_liq.py   # OI-daling vs echte liquidaties (5m)
+python3 proxy_rule.py     # precisie van de detectieregel
+python3 liq_event4h.py    # koersverloop na liquidatiegolven (4H)
 ```
 
 ## Aanbevolen instellingen per stijl

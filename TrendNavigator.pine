@@ -9,6 +9,7 @@
 //   • EMA-lint 9/21 = korte-termijn richting, EMA 50/200 = hoofdtrend
 //   • BUY / SELL    = EMA-cross bevestigd door ADX, volume, EMA 200, HTF en RSI
 //   • Stop          = ATR-trailing stop (of vaste SL/TP) na elk signaal
+//   • Liquidaties   = liquidatie-golven (open interest) + geschatte liq-niveaus
 //   • Dashboard     = alle componenten + trendscore + positie + statistiek
 //
 //  Signalen worden pas bij het sluiten van de candle gegeven (geen repaint).
@@ -19,7 +20,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 //@version=6
-indicator("Trend Navigator [EMA • ADX • Volume]", shorttitle = "TrendNav", overlay = true, max_labels_count = 500)
+indicator("Trend Navigator [EMA • ADX • Volume]", shorttitle = "TrendNav", overlay = true, max_labels_count = 500, max_lines_count = 500)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INSTELLINGEN
@@ -70,6 +71,24 @@ trailMult = input.float(3.0, "Trailing afstand (x ATR)", minval = 0.1, step = 0.
      tooltip = "Afstand van de stop tot de hoogste high (long) / laagste low (short) sinds entry.")
 tpMult    = input.float(3.0, "Take-profit (x ATR, alleen bij Vaste TP)", minval = 0.1, step = 0.1, group = grpRisk)
 bool useTrail = exitMode == "Trailing stop"
+
+grpLiq = "Liquidaties (crypto perps)"
+showLiqEv  = input.bool(true, "Toon liquidatie-golven (open interest)", group = grpLiq,
+     tooltip = "Oranje bol onder de candle = longs geliquideerd, blauwe bol boven = shorts geliquideerd. Gedetecteerd als een abnormale daling van open interest met een candle in dezelfde richting. Grotere bol = heftiger.")
+oiSymIn    = input.string("", "Open-interest symbool (leeg = automatisch)", group = grpLiq,
+     tooltip = "Automatisch = de perp van dezelfde exchange, bv. BINANCE:BTCUSDT.P_OI. Op exchanges zonder perps (bv. Coinbase) vul je zelf iets in als BINANCE:BTCUSDT.P_OI.")
+liqZ       = input.float(2.0, "Gevoeligheid (OI-daling in st.dev.)", minval = 1, step = 0.25, group = grpLiq,
+     tooltip = "Lager = meer bollen. 2.0 = getest tegen echte OKX-liquidaties (85% juiste richting).")
+showLiqLvl = input.bool(true, "Toon geschatte liquidatie-niveaus", group = grpLiq,
+     tooltip = "Vanaf candles met hoog volume wordt berekend waar 25x/50x/100x posities geliquideerd worden. Een niveau verdwijnt zodra de koers het raakt. Niet-geraakte niveaus werken vaak als magneet.")
+lev1       = input.int(25,  "Hefboom", minval = 2, maxval = 200, group = grpLiq, inline = "lev")
+lev2       = input.int(50,  "",        minval = 2, maxval = 200, group = grpLiq, inline = "lev")
+lev3       = input.int(100, "",        minval = 2, maxval = 200, group = grpLiq, inline = "lev")
+lvlVolMult = input.float(1.5, "Niveaus vanaf volume ≥ (x gem.)", minval = 0, step = 0.1, group = grpLiq)
+lvlBack    = input.int(300, "Niveaus van laatste N bars", minval = 20, maxval = 2000, group = grpLiq)
+mmrPct     = input.float(0.5, "Onderhoudsmarge (%)", minval = 0, step = 0.1, group = grpLiq)
+colLongLiq  = input.color(#FF9800, "Long-liq", group = grpLiq, inline = "lcol")
+colShortLiq = input.color(#00BCD4, "Short-liq", group = grpLiq, inline = "lcol")
 
 grpVis = "Weergave"
 colBull    = input.color(#00C853, "Bull", group = grpVis, inline = "col")
@@ -250,6 +269,67 @@ if buySignal or sellSignal
              color = buySignal ? colBull : colBear, textcolor = color.white, size = size.small)
 
 // ─────────────────────────────────────────────────────────────────────────────
+// LIQUIDATIES
+// ─────────────────────────────────────────────────────────────────────────────
+// 1) Liquidatie-golven via open interest (OI). Gedwongen sluitingen laten OI
+//    abnormaal snel dalen; de candlerichting zegt wie er geliquideerd werd.
+string oiAuto   = str.endswith(syminfo.ticker, ".P") ? syminfo.prefix + ":" + syminfo.ticker + "_OI" : syminfo.prefix + ":" + syminfo.ticker + ".P_OI"
+string oiTicker = str.length(oiSymIn) > 0 ? oiSymIn : oiAuto
+float  oiClose  = request.security(oiTicker, timeframe.period, close, ignore_invalid_symbol = true)
+bool   hasOi    = not na(oiClose)
+float  dOi      = hasOi and nz(oiClose[1]) > 0 ? oiClose / oiClose[1] - 1 : na
+float  dOiSd    = ta.stdev(dOi, 50)
+float  oiZ      = dOiSd > 0 ? dOi / dOiSd : na
+bool   liqEvent = hasOi and nz(oiZ) <= -liqZ
+bool   longLiq  = liqEvent and close < open
+bool   shortLiq = liqEvent and close > open
+float  liqSize  = liqEvent ? -oiZ : 0.0
+
+var int lastLiqDir = 0
+var int lastLiqBar = na
+if longLiq or shortLiq
+    lastLiqDir := longLiq ? 1 : -1
+    lastLiqBar := bar_index
+
+int   bars24  = math.max(1, math.round(86400 / timeframe.in_seconds(timeframe.period)))
+float oiChg24 = hasOi and nz(oiClose[bars24]) > 0 ? (oiClose / oiClose[bars24] - 1) * 100 : na
+
+// 2) Geschatte liquidatie-niveaus (hefboom-heatmap light)
+var array<line>  lvlLines = array.new<line>()
+var array<float> lvlPx    = array.new<float>()
+var array<int>   lvlSide  = array.new<int>()   // 1 = long-liq (onder de koers), -1 = short-liq (erboven)
+
+addLevel(float px, int side, int lev) =>
+    color c = side == 1 ? colLongLiq : colShortLiq
+    int   w = lev <= math.min(lev1, lev2, lev3) ? 3 : lev >= math.max(lev1, lev2, lev3) ? 1 : 2
+    array.push(lvlLines, line.new(bar_index, px, bar_index + 1, px, color = color.new(c, 40), width = w))
+    array.push(lvlPx, px)
+    array.push(lvlSide, side)
+    if array.size(lvlLines) > 150   // begrens: oudste niveau weg
+        line.delete(array.shift(lvlLines))
+        array.shift(lvlPx)
+        array.shift(lvlSide)
+
+if showLiqLvl and array.size(lvlLines) > 0
+    for i = array.size(lvlLines) - 1 to 0
+        float lp   = array.get(lvlPx, i)
+        int   side = array.get(lvlSide, i)
+        bool  hit  = side == 1 ? low <= lp : high >= lp
+        if hit   // niveau "opgeveegd": posities geliquideerd → verwijderen
+            line.delete(array.get(lvlLines, i))
+            array.remove(lvlLines, i)
+            array.remove(lvlPx, i)
+            array.remove(lvlSide, i)
+        else
+            line.set_x2(array.get(lvlLines, i), bar_index + 1)
+
+if showLiqLvl and bar_index >= last_bar_index - lvlBack and hasVolume and nz(relVol) >= lvlVolMult
+    float ep = hlc3
+    for lev in array.from(lev1, lev2, lev3)
+        addLevel(ep * (1 - 1.0 / lev + mmrPct / 100), 1, lev)
+        addLevel(ep * (1 + 1.0 / lev - mmrPct / 100), -1, lev)
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PLOTS
 // ─────────────────────────────────────────────────────────────────────────────
 color ribCol = emaFast > emaSlow ? colBull : colBear
@@ -268,6 +348,15 @@ plot(showPos ? entryPx : na, "Entry",       color = color.new(colNeutral, 30), s
 barcolor(colorBars ? trendCol : na, title = "Trendkleur candles")
 bgcolor(showBg ? color.new(trendCol, 90) : na, title = "Trendkleur achtergrond")
 
+bool showL = showLiqEv and longLiq
+bool showS = showLiqEv and shortLiq
+plotshape(showL and liqSize <  3 ? low  - atr * 0.4 : na, "Long-liq",         shape.circle, location.absolute, color.new(colLongLiq, 25),  size = size.tiny)
+plotshape(showL and liqSize >= 3 and liqSize < 4.5 ? low - atr * 0.4 : na, "Long-liq groot", shape.circle, location.absolute, color.new(colLongLiq, 15), size = size.small)
+plotshape(showL and liqSize >= 4.5 ? low  - atr * 0.4 : na, "Long-liq extreem", shape.circle, location.absolute, color.new(colLongLiq, 0),   size = size.normal)
+plotshape(showS and liqSize <  3 ? high + atr * 0.4 : na, "Short-liq",         shape.circle, location.absolute, color.new(colShortLiq, 25), size = size.tiny)
+plotshape(showS and liqSize >= 3 and liqSize < 4.5 ? high + atr * 0.4 : na, "Short-liq groot", shape.circle, location.absolute, color.new(colShortLiq, 15), size = size.small)
+plotshape(showS and liqSize >= 4.5 ? high + atr * 0.4 : na, "Short-liq extreem", shape.circle, location.absolute, color.new(colShortLiq, 0),  size = size.normal)
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ALERTS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -275,6 +364,8 @@ alertcondition(buySignal,  "TrendNav BUY",  "TrendNav BUY {{ticker}} ({{interval
 alertcondition(sellSignal, "TrendNav SELL", "TrendNav SELL {{ticker}} ({{interval}}) @ {{close}}")
 alertcondition(trendState >= 1 and trendState[1] < 1,  "Trend wordt bullish", "TrendNav: {{ticker}} trend wordt BULLISH")
 alertcondition(trendState <= -1 and trendState[1] > -1, "Trend wordt bearish", "TrendNav: {{ticker}} trend wordt BEARISH")
+alertcondition(longLiq,  "Long-liquidaties",  "TrendNav: {{ticker}} long-liquidatiegolf (OI-daling + rode candle) @ {{close}}")
+alertcondition(shortLiq, "Short-liquidaties", "TrendNav: {{ticker}} short-squeeze (OI-daling + groene candle) @ {{close}}")
 
 if buySignal or sellSignal
     alert((buySignal ? "BUY " : "SELL ") + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
@@ -308,7 +399,7 @@ setRow(table t, int row, string k, string v, color vCol, color vBg) =>
     table.cell(t, 0, row, k, text_color = keyCol, text_size = txtSize, text_halign = text.align_left, bgcolor = tblBg)
     table.cell(t, 1, row, v, text_color = vCol,   text_size = txtSize, text_halign = text.align_center, bgcolor = vBg)
 
-var table dash = table.new(tablePosition(tablePosIn), 2, 11, bgcolor = tblBg, border_color = color.new(color.gray, 70), border_width = 1, frame_color = color.new(color.gray, 50), frame_width = 1)
+var table dash = table.new(tablePosition(tablePosIn), 2, 14, bgcolor = tblBg, border_color = color.new(color.gray, 70), border_width = 1, frame_color = color.new(color.gray, 50), frame_width = 1)
 
 if showTable and barstate.islast
     color up = colBull
@@ -363,3 +454,20 @@ if showTable and barstate.islast
     float  openPnl = posDir != 0 ? posDir * (close / entryPx - 1) * 100 : na
     string posTxt  = posDir == 0 ? "geen" : (posDir == 1 ? "LONG " : "SHORT ") + (openPnl > 0 ? "+" : "") + str.tostring(openPnl, "#.0") + "%  •  stop " + str.tostring(slPx, format.mintick)
     setRow(dash, 10, "Positie", posTxt, posDir == 0 ? nt : openPnl > 0 ? up : dn, tblBg)
+
+    // Open interest & liquidaties
+    string oiTxt = hasOi ? (oiChg24 > 0 ? "+" : "") + str.tostring(oiChg24, "#.0") + "% (24u)" : "n.v.t. (zie instellingen)"
+    setRow(dash, 11, "Open interest", oiTxt, not hasOi ? nt : oiChg24 > 0 ? up : dn, tblBg)
+    string lqTxt = na(lastLiqBar) ? "—" : (lastLiqDir == 1 ? "LONGS geliq. • " : "SHORTS geliq. • ") + str.tostring(bar_index - lastLiqBar) + " bars"
+    setRow(dash, 12, "Laatste liq-golf", lqTxt, na(lastLiqBar) ? nt : lastLiqDir == 1 ? colLongLiq : colShortLiq, tblBg)
+    float nearUp = na
+    float nearDn = na
+    if array.size(lvlPx) > 0
+        for lp in lvlPx
+            if lp > close and (na(nearUp) or lp < nearUp)
+                nearUp := lp
+            if lp < close and (na(nearDn) or lp > nearDn)
+                nearDn := lp
+    string upTxt = na(nearUp) ? "—" : "↑ " + str.tostring(nearUp, format.mintick) + " (+" + str.tostring((nearUp / close - 1) * 100, "#.0") + "%)"
+    string dnTxt = na(nearDn) ? "—" : "↓ " + str.tostring(nearDn, format.mintick) + " (" + str.tostring((nearDn / close - 1) * 100, "#.0") + "%)"
+    setRow(dash, 13, "Liq-niveaus", showLiqLvl ? upTxt + "  " + dnTxt : "uit", nt, tblBg)
