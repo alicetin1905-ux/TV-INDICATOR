@@ -1,0 +1,336 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TREND NAVIGATOR  —  EMA-lint • ADX/DMI • Volume • RSI • Hogere timeframe
+// ═══════════════════════════════════════════════════════════════════════════════
+//  In één oogopslag:
+//   • Candlekleur   = trendtoestand (groen = bull, rood = bear, grijs = geen trend)
+//   • EMA-lint 9/21 = korte-termijn richting, EMA 50/200 = hoofdtrend
+//   • BUY / SELL    = EMA-cross bevestigd door ADX, volume, EMA 200, HTF en RSI
+//   • SL / TP       = ATR-gebaseerde stop en doel na elk signaal
+//   • Dashboard     = alle componenten + trendscore + signaalstatistiek
+//
+//  Signalen worden pas bij het sluiten van de candle gegeven (geen repaint).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//@version=6
+indicator("Trend Navigator [EMA • ADX • Volume]", shorttitle = "TrendNav", overlay = true, max_labels_count = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INSTELLINGEN
+// ─────────────────────────────────────────────────────────────────────────────
+grpEma = "EMA's"
+lenFast     = input.int(9,   "Snelle EMA",  minval = 1, group = grpEma, inline = "lint")
+lenSlow     = input.int(21,  "Trage EMA",   minval = 1, group = grpEma, inline = "lint")
+lenMid      = input.int(50,  "Trend EMA",   minval = 1, group = grpEma, inline = "trend")
+lenLong     = input.int(200, "Lange EMA",   minval = 1, group = grpEma, inline = "trend")
+showRibbon  = input.bool(true, "Toon EMA-lint (snel/traag)", group = grpEma)
+showMidLong = input.bool(true, "Toon trend-EMA's (50/200)", group = grpEma)
+
+grpSig = "Signalen"
+sigWindow     = input.int(3, "Bevestigingsvenster na cross (bars)", minval = 0, maxval = 20, group = grpSig,
+     tooltip = "Hoeveel bars na de EMA-cross de filters alsnog mogen bevestigen. 0 = alleen op de cross-candle zelf.")
+useLongFilter = input.bool(true, "Alleen BUY boven / SELL onder lange EMA", group = grpSig)
+useRsi        = input.bool(true, "RSI-filter (geen BUY overbought / SELL oversold)", group = grpSig)
+rsiLen        = input.int(14, "RSI lengte", minval = 1, group = grpSig, inline = "rsi")
+rsiOB         = input.float(70, "OB", minval = 50, maxval = 100, group = grpSig, inline = "rsi")
+rsiOS         = input.float(30, "OS", minval = 0,  maxval = 50,  group = grpSig, inline = "rsi")
+
+grpAdx = "ADX / DMI (trendsterkte)"
+diLen     = input.int(14, "DI lengte", minval = 1, group = grpAdx, inline = "adx")
+adxSmooth = input.int(14, "ADX smoothing", minval = 1, group = grpAdx, inline = "adx")
+adxMin    = input.float(20, "Min. ADX (trend aanwezig)", minval = 0, step = 0.5, group = grpAdx,
+     tooltip = "Onder deze waarde is de markt zijwaarts: candles worden grijs en er komen geen signalen.")
+adxStrong = input.float(30, "Sterke trend vanaf", minval = 0, step = 0.5, group = grpAdx)
+useAdxUp  = input.bool(false, "ADX moet stijgen voor signaal", group = grpAdx)
+
+grpVol = "Volume"
+useVol  = input.bool(true, "Volume-filter gebruiken", group = grpVol,
+     tooltip = "Wordt automatisch overgeslagen op symbolen zonder volumedata (bv. forex bij sommige brokers).")
+volLen  = input.int(20, "Volume gemiddelde (bars)", minval = 1, group = grpVol)
+volMult = input.float(1.2, "Min. relatief volume (x gemiddelde)", minval = 0, step = 0.1, group = grpVol)
+
+grpHtf = "Hogere timeframe (HTF)"
+useHtf = input.bool(true, "HTF-trendfilter gebruiken", group = grpHtf,
+     tooltip = "Geen BUY als de hogere timeframe bearish is, geen SELL als die bullish is. Werkt alleen als HTF ≥ chart-timeframe.")
+htf    = input.timeframe("240", "HTF timeframe", group = grpHtf)
+
+grpRisk = "Risico (ATR)"
+showSlTp = input.bool(true, "Toon SL / TP lijnen", group = grpRisk)
+atrLen   = input.int(14, "ATR lengte", minval = 1, group = grpRisk)
+slMult   = input.float(1.5, "Stop-loss (x ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+tpMult   = input.float(3.0, "Take-profit (x ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+
+grpVis = "Weergave"
+colBull    = input.color(#00C853, "Bull", group = grpVis, inline = "col")
+colBear    = input.color(#FF1744, "Bear", group = grpVis, inline = "col")
+colNeutral = input.color(#787B86, "Neutraal", group = grpVis, inline = "col")
+colorBars  = input.bool(true, "Kleur candles naar trend", group = grpVis)
+showBg     = input.bool(false, "Achtergrond kleuren naar trend", group = grpVis)
+showLabels = input.bool(true, "Toon BUY/SELL labels", group = grpVis)
+showTable  = input.bool(true, "Toon dashboard", group = grpVis)
+tablePosIn = input.string("Rechtsboven", "Dashboard positie", options = ["Rechtsboven", "Rechtsonder", "Linksboven", "Linksonder"], group = grpVis)
+tableSize  = input.string("Klein", "Dashboard tekstgrootte", options = ["Klein", "Normaal", "Groot"], group = grpVis)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BEREKENINGEN
+// ─────────────────────────────────────────────────────────────────────────────
+emaFast = ta.ema(close, lenFast)
+emaSlow = ta.ema(close, lenSlow)
+emaMid  = ta.ema(close, lenMid)
+emaLong = ta.ema(close, lenLong)
+
+[diPlus, diMinus, adx] = ta.dmi(diLen, adxSmooth)
+rsi = ta.rsi(close, rsiLen)
+atr = ta.atr(atrLen)
+
+// Volume (veilig voor symbolen zonder volume)
+bool  hasVolume = ta.cum(nz(volume)) > 0
+float volAvg    = ta.sma(nz(volume), volLen)
+float relVol    = hasVolume and volAvg > 0 ? nz(volume) / volAvg : na
+
+// Hogere timeframe trend — niet-repaintend: bevestigde HTF-bar ([1]) + lookahead_on
+htfTrendCalc() =>
+    float e1 = ta.ema(close, lenMid)
+    float e2 = ta.ema(close, lenLong)
+    int   t  = close > e1 and e1 > e2 ? 1 : close < e1 and e1 < e2 ? -1 : 0
+    t[1]
+
+bool htfValid   = timeframe.in_seconds(htf) >= timeframe.in_seconds(timeframe.period)
+int  htfTrendRq = request.security(syminfo.tickerid, htf, htfTrendCalc(), lookahead = barmerge.lookahead_on)
+bool htfActive  = useHtf and htfValid
+int  htfTrend   = htfActive ? nz(htfTrendRq) : 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRENDSCORE  (elk component +1 bullish / -1 bearish)
+// ─────────────────────────────────────────────────────────────────────────────
+int sPrice = close   > emaMid  ? 1 : -1   // prijs t.o.v. trend-EMA
+int sRib   = emaFast > emaSlow ? 1 : -1   // EMA-lint
+int sTrend = emaMid  > emaLong ? 1 : -1   // EMA 50 vs 200 (golden/death cross)
+int sDmi   = diPlus  > diMinus ? 1 : -1   // richting volgens DMI
+int sRsi   = rsi     > 50      ? 1 : -1   // momentum
+int score    = sPrice + sRib + sTrend + sDmi + sRsi + htfTrend
+int maxScore = htfActive ? 6 : 5
+
+bool sideways = adx < adxMin
+// 2 = sterk bull, 1 = bull, 0 = neutraal/zijwaarts, -1 = bear, -2 = sterk bear
+int trendState = sideways ? 0 :
+     score >=  4 and adx >= adxStrong ?  2 :
+     score >=  2                      ?  1 :
+     score <= -4 and adx >= adxStrong ? -2 :
+     score <= -2                      ? -1 : 0
+
+color trendCol = switch trendState
+    2  => colBull
+    1  => color.new(colBull, 45)
+    -1 => color.new(colBear, 45)
+    -2 => colBear
+    => colNeutral
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNALEN
+// ─────────────────────────────────────────────────────────────────────────────
+bool crossUp = ta.crossover(emaFast, emaSlow)
+bool crossDn = ta.crossunder(emaFast, emaSlow)
+
+bool bullSetup = nz(ta.barssince(crossUp), 9999) <= sigWindow and emaFast > emaSlow
+bool bearSetup = nz(ta.barssince(crossDn), 9999) <= sigWindow and emaFast < emaSlow
+
+bool adxOk = adx >= adxMin and (not useAdxUp or adx > adx[1])
+bool volOk = not useVol or not hasVolume or nz(relVol) >= volMult
+
+bool longOk  = adxOk and volOk and diPlus > diMinus and
+     (not useLongFilter or close > emaLong) and
+     (not htfActive or htfTrend >= 0) and
+     (not useRsi or rsi < rsiOB)
+
+bool shortOk = adxOk and volOk and diMinus > diPlus and
+     (not useLongFilter or close < emaLong) and
+     (not htfActive or htfTrend <= 0) and
+     (not useRsi or rsi > rsiOS)
+
+// Eén signaal per cross, alleen op een gesloten candle
+var bool usedUp = false
+var bool usedDn = false
+if crossUp
+    usedUp := false
+if crossDn
+    usedDn := false
+
+bool buySignal  = bullSetup and longOk  and not usedUp and barstate.isconfirmed
+bool sellSignal = bearSetup and shortOk and not usedDn and barstate.isconfirmed
+if buySignal
+    usedUp := true
+if sellSignal
+    usedDn := true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POSITIE-TRACKING: SL / TP + eenvoudige signaalstatistiek
+// ─────────────────────────────────────────────────────────────────────────────
+var int   posDir  = 0
+var float entryPx = na
+var float slPx    = na
+var float tpPx    = na
+var int   wins    = 0
+var int   losses  = 0
+var int   lastSig = 0
+var int   lastSigBar = na
+
+// 1) bestaande positie: SL/TP geraakt? (bij beide in één candle: conservatief SL)
+bool tpHit = false
+bool slHit = false
+if posDir == 1
+    if low <= slPx
+        slHit := true
+    else if high >= tpPx
+        tpHit := true
+else if posDir == -1
+    if high >= slPx
+        slHit := true
+    else if low <= tpPx
+        tpHit := true
+
+if tpHit or slHit
+    if tpHit
+        wins += 1
+    else
+        losses += 1
+    if showSlTp
+        label.new(bar_index, posDir == 1 ? (tpHit ? high : low) : (tpHit ? low : high),
+             tpHit ? "TP ✓" : "SL ✗",
+             style = posDir == 1 ? (tpHit ? label.style_label_down : label.style_label_up) : (tpHit ? label.style_label_up : label.style_label_down),
+             color = color.new(tpHit ? colBull : colBear, 30), textcolor = color.white, size = size.tiny)
+    posDir := 0
+
+// 2) nieuw signaal (sluit een tegengestelde positie op de slotkoers)
+if buySignal or sellSignal
+    int newDir = buySignal ? 1 : -1
+    if posDir == -newDir
+        bool won = posDir == 1 ? close > entryPx : close < entryPx
+        if won
+            wins += 1
+        else
+            losses += 1
+    posDir     := newDir
+    entryPx    := close
+    slPx       := close - newDir * atr * slMult
+    tpPx       := close + newDir * atr * tpMult
+    lastSig    := newDir
+    lastSigBar := bar_index
+    if showLabels
+        string txt = (buySignal ? "BUY" : "SELL") + "\n" + (score > 0 ? "+" : "") + str.tostring(score) + "/" + str.tostring(maxScore)
+        label.new(bar_index, close, txt,
+             yloc = buySignal ? yloc.belowbar : yloc.abovebar,
+             style = buySignal ? label.style_label_up : label.style_label_down,
+             color = buySignal ? colBull : colBear, textcolor = color.white, size = size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLOTS
+// ─────────────────────────────────────────────────────────────────────────────
+color ribCol = emaFast > emaSlow ? colBull : colBear
+pFast = plot(showRibbon ? emaFast : na, "EMA snel",  color = ribCol, linewidth = 1)
+pSlow = plot(showRibbon ? emaSlow : na, "EMA traag", color = ribCol, linewidth = 1)
+fill(pFast, pSlow, color = color.new(ribCol, 75), title = "EMA-lint vulling")
+
+plot(showMidLong ? emaMid  : na, "EMA trend", color = color.new(#FF9800, 0), linewidth = 2)
+plot(showMidLong ? emaLong : na, "EMA lang",  color = color.new(#7E57C2, 0), linewidth = 3)
+
+bool showPos = showSlTp and posDir != 0
+plot(showPos ? slPx    : na, "Stop-loss",   color = color.new(colBear, 0), style = plot.style_linebr, linewidth = 1)
+plot(showPos ? tpPx    : na, "Take-profit", color = color.new(colBull, 0), style = plot.style_linebr, linewidth = 1)
+plot(showPos ? entryPx : na, "Entry",       color = color.new(colNeutral, 30), style = plot.style_linebr, linewidth = 1)
+
+barcolor(colorBars ? trendCol : na, title = "Trendkleur candles")
+bgcolor(showBg ? color.new(trendCol, 90) : na, title = "Trendkleur achtergrond")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(buySignal,  "TrendNav BUY",  "TrendNav BUY {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(sellSignal, "TrendNav SELL", "TrendNav SELL {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(trendState >= 1 and trendState[1] < 1,  "Trend wordt bullish", "TrendNav: {{ticker}} trend wordt BULLISH")
+alertcondition(trendState <= -1 and trendState[1] > -1, "Trend wordt bearish", "TrendNav: {{ticker}} trend wordt BEARISH")
+
+if buySignal or sellSignal
+    alert((buySignal ? "BUY " : "SELL ") + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
+         " | SL " + str.tostring(slPx, format.mintick) + " | TP " + str.tostring(tpPx, format.mintick) +
+         " | score " + str.tostring(score) + "/" + str.tostring(maxScore) + " | ADX " + str.tostring(adx, "#.0"),
+         alert.freq_once_per_bar_close)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+// ─────────────────────────────────────────────────────────────────────────────
+tablePosition(string p) =>
+    switch p
+        "Rechtsonder" => position.bottom_right
+        "Linksboven"  => position.top_left
+        "Linksonder"  => position.bottom_left
+        => position.top_right
+
+tfText(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s >= 2592000 ? str.tostring(s / 2592000, "#") + "M" :
+     s >= 604800 ? str.tostring(s / 604800, "#.#") + "W" :
+     s >= 86400  ? str.tostring(s / 86400, "#.#") + "D" :
+     s >= 3600   ? str.tostring(s / 3600, "#.#") + "H" :
+     s >= 60     ? str.tostring(s / 60, "#") + "m" : str.tostring(s) + "s"
+
+string txtSize = tableSize == "Groot" ? size.normal : tableSize == "Normaal" ? size.small : size.tiny
+color  tblBg   = color.new(#131722, 10)
+color  keyCol  = color.new(color.white, 25)
+
+setRow(table t, int row, string k, string v, color vCol, color vBg) =>
+    table.cell(t, 0, row, k, text_color = keyCol, text_size = txtSize, text_halign = text.align_left, bgcolor = tblBg)
+    table.cell(t, 1, row, v, text_color = vCol,   text_size = txtSize, text_halign = text.align_center, bgcolor = vBg)
+
+var table dash = table.new(tablePosition(tablePosIn), 2, 10, bgcolor = tblBg, border_color = color.new(color.gray, 70), border_width = 1, frame_color = color.new(color.gray, 50), frame_width = 1)
+
+if showTable and barstate.islast
+    color up = colBull
+    color dn = colBear
+    color nt = colNeutral
+
+    // Trend
+    string tTxt = switch trendState
+        2  => "STERK BULLISH ▲▲"
+        1  => "BULLISH ▲"
+        -1 => "BEARISH ▼"
+        -2 => "STERK BEARISH ▼▼"
+        => sideways ? "ZIJWAARTS ◆" : "NEUTRAAL ◆"
+    setRow(dash, 0, "TrendNav " + tfText(timeframe.period), tTxt, color.white, trendCol)
+
+    // Score
+    setRow(dash, 1, "Trendscore", (score > 0 ? "+" : "") + str.tostring(score) + " / " + str.tostring(maxScore),
+         score > 0 ? up : score < 0 ? dn : nt, tblBg)
+
+    // ADX
+    string adxTxt = str.tostring(adx, "#.0") + (adx >= adxStrong ? "  sterk" : adx >= adxMin ? "  trend" : "  zwak") + (adx > adx[1] ? " ↑" : " ↓")
+    setRow(dash, 2, "ADX", adxTxt, adx >= adxMin ? color.white : nt, tblBg)
+
+    // DMI
+    setRow(dash, 3, "DI+ / DI−", str.tostring(diPlus, "#.0") + " / " + str.tostring(diMinus, "#.0"), diPlus > diMinus ? up : dn, tblBg)
+
+    // EMA-lint & trend
+    setRow(dash, 4, "EMA " + str.tostring(lenFast) + "/" + str.tostring(lenSlow), emaFast > emaSlow ? "bullish" : "bearish", emaFast > emaSlow ? up : dn, tblBg)
+    setRow(dash, 5, "EMA " + str.tostring(lenMid) + "/" + str.tostring(lenLong),
+         (emaMid > emaLong ? "golden" : "death") + (close > emaLong ? " • boven " : " • onder ") + str.tostring(lenLong),
+         emaMid > emaLong ? up : dn, tblBg)
+
+    // Volume
+    string vTxt = hasVolume ? str.tostring(relVol, "#.00") + "x" + (relVol >= volMult ? "  hoog" : relVol >= 0.8 ? "  normaal" : "  laag") : "n.v.t."
+    setRow(dash, 6, "Volume", vTxt, not hasVolume ? nt : relVol >= volMult ? up : relVol >= 0.8 ? color.white : nt, tblBg)
+
+    // RSI
+    setRow(dash, 7, "RSI", str.tostring(rsi, "#.0") + (rsi >= rsiOB ? "  overbought" : rsi <= rsiOS ? "  oversold" : ""),
+         rsi >= rsiOB or rsi <= rsiOS ? color.yellow : rsi > 50 ? up : dn, tblBg)
+
+    // HTF
+    string hTxt = not useHtf ? "uit" : not htfValid ? "HTF < chart" : htfTrend == 1 ? "BULLISH" : htfTrend == -1 ? "BEARISH" : "NEUTRAAL"
+    setRow(dash, 8, "HTF " + tfText(htf), hTxt, htfTrend == 1 ? up : htfTrend == -1 ? dn : nt, tblBg)
+
+    // Laatste signaal + statistiek
+    int    total  = wins + losses
+    string sigTxt = lastSig == 0 ? "—" : (lastSig == 1 ? "BUY" : "SELL") + " • " + str.tostring(bar_index - lastSigBar) + " bars"
+    string stTxt  = total > 0 ? "  |  " + str.tostring(100.0 * wins / total, "#") + "% (" + str.tostring(wins) + "/" + str.tostring(total) + ")" : ""
+    setRow(dash, 9, "Signaal | hit-rate", sigTxt + stTxt, lastSig == 1 ? up : lastSig == -1 ? dn : nt, tblBg)
