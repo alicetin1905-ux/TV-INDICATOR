@@ -25,13 +25,14 @@ De standaardinstellingen zijn **gebacktest en getoetst buiten de trainingsdata**
 | **Candlekleur** | Fel groen = sterk bullish · lichtgroen = bullish · **grijs = zijwaarts (ADX laag): niet handelen** · lichtrood = bearish · fel rood = sterk bearish |
 | **EMA-lint 9/21** | Groen gevuld = korte termijn omhoog, rood = omlaag |
 | **EMA 50 (oranje) / 200 (paars)** | Hoofdtrend |
-| **BUY / SELL** | Bevestigd signaal + trendscore (bv. `+5/6`) |
+| **BUY / SELL** | Bevestigd signaal + trendscore + positiegrootte (bv. `+5/6`, `0.42 BTC • 1%`) |
+| **RE-BUY / RE-SELL** (lichter, kleiner) | Herinstap na een stop-out terwijl de trend intact is |
 | **Rode stoplijn** | Start op 2× ATR en schuift mee op 3× ATR van de hoogste high (long) of laagste low (short) |
 | **EXIT +x%** | Positie gesloten door de stop, met resultaat |
 | **Oranje bol onder candle** | Long-liquidatiegolf (longs gedwongen gesloten). Grotere bol = heftiger |
 | **Blauwe bol boven candle** | Short-liquidatiegolf (short squeeze) |
 | **Oranje/blauwe lijnen** | Geschatte liquidatieniveaus van 25×/50×/100× posities. Dikker = lagere hefboom. Verdwijnen zodra de koers ze raakt |
-| **Dashboard** | Trend, score, ADX, DI+/DI−, EMA's, volume, RSI, HTF-trend, laatste signaal + hit-rate, open positie, open interest 24u, laatste liquidatiegolf, dichtstbijzijnde liq-niveaus |
+| **Dashboard** | Trend, score, ADX, DI+/DI−, EMA's, volume, RSI, HTF-trend, laatste signaal + hit-rate, open positie, open interest 24u, laatste liquidatiegolf, dichtstbijzijnde liq-niveaus, BTC-filter, positiegrootte |
 
 ## Signaallogica
 
@@ -42,9 +43,25 @@ De standaardinstellingen zijn **gebacktest en getoetst buiten de trainingsdata**
 3. Volume ≥ 1,0× het 20-bar gemiddelde
 4. Koers boven EMA 200
 5. Dagtrend (HTF = 1D) niet bearish
-6. RSI < 70
+6. **BTC niet bearish** (alleen op altcoins; BTC-koers < EMA 50 < EMA 200 op dezelfde timeframe)
+7. RSI < 70
 
 **SELL** is het spiegelbeeld. Een tegengesteld signaal draait de positie om.
+
+**RE-BUY (herinstap):** de vorige long is door de stop gesloten, en nu:
+- sluit de koers weer boven EMA 9;
+- staat EMA 50 boven EMA 200 en de koers boven EMA 200;
+- is de dagtrend bullish, BTC niet bearish, DI+ > DI− en RSI < 70.
+
+Maximaal 1× per trend (instelbaar). Vervalt zodra EMA 50 onder EMA 200 zakt. **RE-SELL** is het spiegelbeeld.
+
+## Positiegrootte
+
+Bij elk signaal berekent de indicator hoeveel je moet kopen om **X% van je account** te riskeren tot de start-stop:
+
+`grootte = account × risico% ÷ (entry − stop)`, begrensd door de max. hefboom (standaard 3×).
+
+Vul je **accountgrootte** en **risico per trade** (standaard 1%) in onder *Positiegrootte*. De grootte staat in het label, de alert en het dashboard. Omdat de stop van SOL en HYPE verder weg ligt (±4,8%) dan die van BTC (±2,4%), koop je automatisch minder van de volatielere munten: elke trade riskeert hetzelfde bedrag.
 
 **Trendscore (−6 … +6):** koers vs EMA 50, EMA 9 vs 21, EMA 50 vs 200, DI+ vs DI−, RSI vs 50 en de HTF-trend tellen elk ±1.
 
@@ -80,16 +97,25 @@ Lees dit als *context*, niet als signaal: in een uptrend is een long-flush vaak 
 
 **Methode:** grid search over 1.800 combinaties per timeframe (EMA-paren, ADX, volume, filters, 5 exit-methodes, long-only of long+short). Er is alleen geoptimaliseerd op de **eerste 65%** van de data; de **laatste 35%** dient als ongeziene test. Gekozen is de configuratie die op de *slechtste* munt het best presteert, niet die met de hoogste winst op één munt.
 
-### Resultaat standaardinstellingen (4H)
+### Resultaat standaardinstellingen (4H, met herinstap + BTC-filter)
 
-| Munt | Trades | Winrate | Profit factor | Rendement | Max DD | PF train | PF test (rendement) | Buy & hold |
+| Munt | Trades (waarvan herinstap) | Winrate | PF | PF train | PF test | 100% kapitaal: rendement / max DD | **2% risico (max 3×): rendement / max DD** | Buy & hold |
 |---|---|---|---|---|---|---|---|---|
-| BTC  | 97  | 37% | 1.61 | +77%  | 23% | 1.66 | 1.56 (+24%)  | +244% |
-| ETH  | 105 | 34% | 1.78 | +211% | 30% | 1.18 | 2.98 (+179%) | +34%  |
-| SOL  | 102 | 41% | 1.27 | +44%  | 32% | 1.05 | 1.72 (+56%)  | +492% |
-| HYPE | 29  | 52% | 2.20 | +83%  | 19% | 1.91 | 3.85 (+27%)  | +100% |
+| BTC  | 122 (34) | 36% | 1.58 | 1.62 | 1.56 | +106% / 18% | **+97% / 16%**  | +244% |
+| ETH  | 128 (35) | 34% | 1.59 | 1.21 | 2.17 | +174% / 30% | **+120% / 19%** | +34%  |
+| SOL  | 132 (40) | 42% | 1.33 | 1.34 | 1.31 | +91% / 36%  | **+74% / 13%**  | +492% |
+| HYPE | 23 (3)   | 48% | 2.03 | 1.54 | 4.96 | +48% / 25%  | **+12% / 10%**  | +100% |
 
-Testperiode: vanaf juni 2025 (HYPE: vanaf juli 2026).
+Testperiode: vanaf juni 2025 (HYPE: vanaf juli 2026). PF = profit factor (bruto winst ÷ bruto verlies). De Strategy-versie gebruikt standaard 2% risico per trade.
+
+### Vorige versie (zonder herinstap en BTC-filter)
+
+| Munt | PF | PF train | PF test | Rendement / max DD |
+|---|---|---|---|---|
+| BTC  | 1.61 | 1.66 | 1.56 | +77% / 23%  |
+| ETH  | 1.78 | 1.18 | 2.98 | +211% / 30% |
+| SOL  | 1.27 | 1.05 | 1.72 | +44% / 32%  |
+| HYPE | 2.20 | 1.91 | 3.85 | +83% / 19%  |
 
 ### Wat de backtest leerde
 
@@ -98,12 +124,15 @@ Testperiode: vanaf juni 2025 (HYPE: vanaf juli 2026).
 - **Robuust:** als je ADX (10–20), stop (1,5–3×), trailing (3–3,5×), EMA's (10–12 / 21–30) of het venster (0–5) varieert, blijft de profit factor op alle munten boven 1.
 - **EMA 200-filter:** zonder dit filter daalt de profit factor fors (SOL 1.05).
 - **HTF 1D aan:** zelfde profit factor, lagere drawdown (SOL 32% in plaats van 46%). Deze keuze is gemaakt op de volledige periode.
+- **Herinstap** (225 varianten getest): de slechtste munt in de train-periode gaat van PF 1,05 naar 1,21. Het helpt vooral in trendjaren (BTC 2023: +15% → +30%, SOL 2023: +12% → +90%), maar kost soms iets in zijwaartse jaren (SOL 2025: +43% → +14%). Strengere varianten (ook EMA-lint of ADX vereisen, meer herinstappen) en een wijdere trailing stop in sterke trends scoorden slechter.
+- **BTC-filter:** op 4H helpt het SOL duidelijk (PF 1,27 → 1,35), ETH blijft gelijk, en HYPE verliest rendement (minder trades; HYPE beweegt minder met BTC mee). Netto beter op de slechtste munt, dus standaard aan. **Voor HYPE kun je het filter overwegen uit te zetten.** Een BTC-filter op de dag-timeframe was schadelijk (ETH PF 0,73 in train).
+- **Positiegrootte op basis van risico** verlaagt de drawdown fors (SOL: 36% → 13%) terwijl het grootste deel van het rendement blijft. Rendement per eenheid drawdown verbetert op alle munten.
 
 ### Eerlijke kanttekeningen
 
-- In sterke bull-jaren verdien je **veel minder dan met buy & hold** (BTC 2023: +16% tegenover +156%). De kracht zit in bear-markten: in 2025–2026 bleef de strategie winstgevend terwijl de munten 35–46% daalden.
+- In sterke bull-jaren verdien je **veel minder dan met buy & hold** (BTC 2023: +30% tegenover +156%, ook met herinstap). De kracht zit in bear-markten: in 2025–2026 bleef de strategie winstgevend terwijl de munten 35–46% daalden.
 - Winrate ±35–50%: je hebt veel kleine verliezen en een paar grote winnaars. Dat vraagt discipline.
-- HYPE heeft maar een jaar data en 29 trades, dus die cijfers zijn statistisch zwak.
+- HYPE heeft maar een jaar data en 23 trades, dus die cijfers zijn statistisch zwak.
 - Resultaten uit het verleden bieden geen garantie. Dit is geen financieel advies.
 
 ### Zelf opnieuw draaien
@@ -114,6 +143,8 @@ python3 fetch.py          # haalt OKX-candles op naar backtest/data/
 python3 grid.py 4H        # grid search (ook: 1H, 15m)
 python3 analyze.py 4H 6   # top-configs met train/test-resultaten
 python3 stress.py         # gevoeligheid + resultaten per jaar
+python3 grid2.py          # herinstap / BTC-filter / bull-trail (engine2.py)
+python3 final2.py         # per jaar + positiegrootte
 
 # liquidaties
 python3 fetch_oi.py && python3 fetch_liq.py

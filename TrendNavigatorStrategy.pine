@@ -11,6 +11,9 @@
 //  • Start-stop = 2× ATR, daarna trailing stop op 3× ATR van de hoogste high /
 //    laagste low sinds entry (of optioneel een vaste TP)
 //  • Tegengesteld signaal = omdraaien (of alleen sluiten bij "Alleen long")
+//  • Herinstap na stop-out zolang de trend intact is
+//  • BTC-trendfilter voor altcoins
+//  • Positiegrootte: X% risico van de equity tot de start-stop (max. hefboom)
 //  • Kosten: 0,07% per kant (0,05% fee + ~0,02% slippage)
 //
 //  Aanbevolen: 4H-chart, BTC / ETH / SOL / HYPE (USDT-perp of spot).
@@ -19,6 +22,7 @@
 //@version=6
 strategy("Trend Navigator Strategy", shorttitle = "TrendNav-S", overlay = true,
      initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100,
+     margin_long = 20, margin_short = 20,
      commission_type = strategy.commission.percent, commission_value = 0.07, pyramiding = 0,
      calc_on_every_tick = false, process_orders_on_close = false)
 
@@ -61,6 +65,17 @@ trailMult = input.float(3.0, "Trailing afstand (x ATR)", minval = 0.1, step = 0.
 tpMult    = input.float(3.0, "Take-profit (x ATR, alleen Vaste TP)", minval = 0.1, step = 0.1, group = grpRisk)
 bool useTrail = exitMode == "Trailing stop"
 
+grpRe = "Herinstap & BTC-filter"
+useReEntry = input.bool(true, "Herinstap na stop als trend intact", group = grpRe)
+reMax      = input.int(1, "Max. herinstappen per trend", minval = 1, maxval = 5, group = grpRe)
+useBtc     = input.bool(true, "BTC-trendfilter voor altcoins", group = grpRe)
+btcSym     = input.symbol("BINANCE:BTCUSDT", "BTC-symbool", group = grpRe)
+
+grpSize = "Positiegrootte"
+sizeMode = input.string("Risico %", "Methode", options = ["Risico %", "100% equity"], group = grpSize)
+riskPct  = input.float(2.0, "Risico per trade (%)", minval = 0.1, maxval = 10, step = 0.25, group = grpSize)
+maxLev   = input.float(3.0, "Max. hefboom", minval = 1, maxval = 5, step = 0.5, group = grpSize)
+
 grpDate = "Periode"
 useDate   = input.bool(false, "Alleen vanaf startdatum", group = grpDate)
 startDate = input.time(timestamp("2023-01-01T00:00:00"), "Startdatum", group = grpDate)
@@ -89,6 +104,16 @@ int  htfTrendRq = request.security(syminfo.tickerid, htf, htfTrendCalc(), lookah
 bool htfActive  = useHtf and htfValid
 int  htfTrend   = htfActive ? nz(htfTrendRq) : 0
 
+btcTrendCalc() =>
+    float e1 = ta.ema(close, lenMid)
+    float e2 = ta.ema(close, lenLong)
+    close > e1 and e1 > e2 ? 1 : close < e1 and e1 < e2 ? -1 : 0
+
+bool isBtc      = syminfo.basecurrency == "BTC"
+int  btcTrendRq = request.security(btcSym, timeframe.period, btcTrendCalc(), ignore_invalid_symbol = true)
+int  btcTrend   = useBtc and not isBtc ? nz(btcTrendRq) : 0
+emaMid = ta.ema(close, lenMid)
+
 // ─── Signalen ──────────────────────────────────────────────────────────────────
 bool crossUp = ta.crossover(emaFast, emaSlow)
 bool crossDn = ta.crossunder(emaFast, emaSlow)
@@ -99,9 +124,9 @@ bool adxOk = adx >= adxMin and (not useAdxUp or adx > adx[1])
 bool volOk = not useVol or not hasVolume or nz(relVol) >= volMult
 
 bool longOk  = adxOk and volOk and diPlus > diMinus and
-     (not useLongFilter or close > emaLong) and (not htfActive or htfTrend >= 0) and (not useRsi or rsi < rsiOB)
+     (not useLongFilter or close > emaLong) and (not htfActive or htfTrend >= 0) and btcTrend >= 0 and (not useRsi or rsi < rsiOB)
 bool shortOk = adxOk and volOk and diMinus > diPlus and
-     (not useLongFilter or close < emaLong) and (not htfActive or htfTrend <= 0) and (not useRsi or rsi > rsiOS)
+     (not useLongFilter or close < emaLong) and (not htfActive or htfTrend <= 0) and btcTrend <= 0 and (not useRsi or rsi > rsiOS)
 
 var bool usedUp = false
 var bool usedDn = false
@@ -122,8 +147,15 @@ var float shortStop = na
 var float longTp    = na
 var float shortTp   = na
 var float extPx     = na
+var int   canRe     = 0
+var int   reCount   = 0
 
-// trailing stop bijwerken zolang we in een positie zitten
+// 1) gestopt (niet omgedraaid)? → herinstap mogelijk
+if strategy.position_size == 0 and strategy.position_size[1] != 0 and strategy.closedtrades > 0
+    if strategy.closedtrades.exit_comment(strategy.closedtrades - 1) == "stop"
+        canRe := strategy.position_size[1] > 0 ? 1 : -1
+
+// 2) trailing stop bijwerken zolang we in een positie zitten
 if useTrail and strategy.position_size > 0
     extPx    := math.max(extPx, high)
     longStop := math.max(longStop, extPx - atr * trailMult)
@@ -131,22 +163,47 @@ else if useTrail and strategy.position_size < 0
     extPx     := math.min(extPx, low)
     shortStop := math.min(shortStop, extPx + atr * trailMult)
 
-if inDate and buySignal and strategy.position_size <= 0
-    strategy.entry("Long", strategy.long)
+// 3) herinstap-voorwaarden
+if buySignal or sellSignal
+    canRe   := 0
+    reCount := 0
+bool closeUpFast = close > emaFast and close[1] <= emaFast[1]
+bool closeDnFast = close < emaFast and close[1] >= emaFast[1]
+bool flat   = strategy.position_size == 0
+bool reBuy  = useReEntry and flat and canRe == 1 and reCount < reMax and closeUpFast and emaMid > emaLong and close > emaLong and
+     (not htfActive or htfTrend == 1) and btcTrend >= 0 and diPlus > diMinus and (not useRsi or rsi < rsiOB) and not buySignal and not sellSignal
+bool reSell = useReEntry and flat and canRe == -1 and reCount < reMax and closeDnFast and emaMid < emaLong and close < emaLong and
+     (not htfActive or htfTrend == -1) and btcTrend <= 0 and diMinus > diPlus and (not useRsi or rsi > rsiOS) and not buySignal and not sellSignal and not longOnly
+if (canRe == 1 and emaMid < emaLong) or (canRe == -1 and emaMid > emaLong)
+    canRe := 0
+
+// 4) positiegrootte
+calcQty() =>
+    float stopDist = atr * slMult
+    float q = sizeMode == "Risico %" ? strategy.equity * riskPct / 100 / stopDist : strategy.equity / close
+    math.min(q, maxLev * strategy.equity / close)
+
+// 5) orders
+if inDate and (buySignal or reBuy) and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long, qty = calcQty(), comment = reBuy ? "RE-BUY" : "BUY")
     longStop := close - atr * slMult
     longTp   := useTrail ? na : close + atr * tpMult
     extPx    := close
-else if inDate and sellSignal
-    if longOnly
+    if reBuy
+        reCount += 1
+else if inDate and (sellSignal or reSell)
+    if longOnly and sellSignal
         strategy.close("Long", comment = "SELL")
     else if strategy.position_size >= 0
-        strategy.entry("Short", strategy.short)
+        strategy.entry("Short", strategy.short, qty = calcQty(), comment = reSell ? "RE-SELL" : "SELL")
         shortStop := close + atr * slMult
         shortTp   := useTrail ? na : close - atr * tpMult
         extPx     := close
+        if reSell
+            reCount += 1
 
-strategy.exit("XL", "Long",  stop = longStop,  limit = longTp,  comment_loss = "stop", comment_profit = "exit +")
-strategy.exit("XS", "Short", stop = shortStop, limit = shortTp, comment_loss = "stop", comment_profit = "exit +")
+strategy.exit("XL", "Long",  stop = longStop,  limit = longTp,  comment_loss = "stop", comment_profit = "TP")
+strategy.exit("XS", "Short", stop = shortStop, limit = shortTp, comment_loss = "stop", comment_profit = "TP")
 
 // ─── Plots ─────────────────────────────────────────────────────────────────────
 color ribCol = emaFast > emaSlow ? color.new(#00C853, 0) : color.new(#FF1744, 0)

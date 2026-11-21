@@ -9,6 +9,9 @@
 //   • EMA-lint 9/21 = korte-termijn richting, EMA 50/200 = hoofdtrend
 //   • BUY / SELL    = EMA-cross bevestigd door ADX, volume, EMA 200, HTF en RSI
 //   • Stop          = ATR-trailing stop (of vaste SL/TP) na elk signaal
+//   • RE-BUY/RE-SELL= herinstap na stop-out zolang de trend intact is
+//   • BTC-filter    = geen alt-long tegen een bearish BTC in (en omgekeerd)
+//   • Positiegrootte= hoeveel je koopt voor X% risico tot de stop
 //   • Liquidaties   = liquidatie-golven (open interest) + geschatte liq-niveaus
 //   • Dashboard     = alle componenten + trendscore + positie + statistiek
 //
@@ -72,6 +75,21 @@ trailMult = input.float(3.0, "Trailing afstand (x ATR)", minval = 0.1, step = 0.
 tpMult    = input.float(3.0, "Take-profit (x ATR, alleen bij Vaste TP)", minval = 0.1, step = 0.1, group = grpRisk)
 bool useTrail = exitMode == "Trailing stop"
 
+grpRe = "Herinstap & BTC-filter"
+useReEntry = input.bool(true, "Herinstap na stop als trend intact", group = grpRe,
+     tooltip = "Na een stop-out: opnieuw instappen als de koers weer boven EMA-snel sluit, terwijl EMA 50 > EMA 200, koers > EMA 200 en de HTF-trend bullish is (short: spiegelbeeld). Vervalt bij een tegengestelde EMA 50/200-cross.")
+reMax      = input.int(1, "Max. herinstappen per trend", minval = 1, maxval = 5, group = grpRe)
+useBtc     = input.bool(true, "BTC-trendfilter voor altcoins", group = grpRe,
+     tooltip = "Geen long op een altcoin als BTC bearish is (koers < EMA 50 < EMA 200 op dezelfde timeframe), geen short als BTC bullish is. Op BTC zelf genegeerd. Backtest: helpt vooral SOL, kost HYPE rendement.")
+btcSym     = input.symbol("BINANCE:BTCUSDT", "BTC-symbool", group = grpRe)
+
+grpSize = "Positiegrootte"
+showSize = input.bool(true, "Toon positiegrootte bij signaal", group = grpSize)
+accSize  = input.float(10000, "Accountgrootte (in quote, bv. USDT)", minval = 1, step = 100, group = grpSize)
+riskPct  = input.float(1.0, "Risico per trade (%)", minval = 0.1, maxval = 10, step = 0.25, group = grpSize,
+     tooltip = "Verlies als de start-stop geraakt wordt. Backtest: 1–2% geeft veel lagere drawdown dan 100% inzet.")
+maxLev   = input.float(3.0, "Max. hefboom", minval = 1, step = 0.5, group = grpSize)
+
 grpLiq = "Liquidaties (crypto perps)"
 showLiqEv  = input.bool(true, "Toon liquidatie-golven (open interest)", group = grpLiq,
      tooltip = "Oranje bol onder de candle = longs geliquideerd, blauwe bol boven = shorts geliquideerd. Gedetecteerd als een abnormale daling van open interest met een candle in dezelfde richting. Grotere bol = heftiger.")
@@ -130,6 +148,17 @@ int  htfTrendRq = request.security(syminfo.tickerid, htf, htfTrendCalc(), lookah
 bool htfActive  = useHtf and htfValid
 int  htfTrend   = htfActive ? nz(htfTrendRq) : 0
 
+// BTC-trend (zelfde timeframe) als filter voor altcoins
+btcTrendCalc() =>
+    float e1 = ta.ema(close, lenMid)
+    float e2 = ta.ema(close, lenLong)
+    close > e1 and e1 > e2 ? 1 : close < e1 and e1 < e2 ? -1 : 0
+
+bool isBtc      = syminfo.basecurrency == "BTC"
+int  btcTrendRq = request.security(btcSym, timeframe.period, btcTrendCalc(), ignore_invalid_symbol = true)
+bool btcActive  = useBtc and not isBtc
+int  btcTrend   = btcActive ? nz(btcTrendRq) : 0
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TRENDSCORE  (elk component +1 bullish / -1 bearish)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,12 +199,12 @@ bool volOk = not useVol or not hasVolume or nz(relVol) >= volMult
 
 bool longOk  = adxOk and volOk and diPlus > diMinus and
      (not useLongFilter or close > emaLong) and
-     (not htfActive or htfTrend >= 0) and
+     (not htfActive or htfTrend >= 0) and btcTrend >= 0 and
      (not useRsi or rsi < rsiOB)
 
 bool shortOk = adxOk and volOk and diMinus > diPlus and
      (not useLongFilter or close < emaLong) and
-     (not htfActive or htfTrend <= 0) and
+     (not htfActive or htfTrend <= 0) and btcTrend <= 0 and
      (not useRsi or rsi > rsiOS)
 
 // Eén signaal per cross, alleen op een gesloten candle
@@ -193,6 +222,9 @@ if buySignal
 if sellSignal
     usedDn := true
 
+fmtQty(float q) =>
+    str.tostring(q, q >= 1000 ? "#,###" : q >= 10 ? "#,###.#" : q >= 1 ? "#.###" : "#.#####")
+
 // ─────────────────────────────────────────────────────────────────────────────
 // POSITIE-TRACKING: SL / TP + eenvoudige signaalstatistiek
 // ─────────────────────────────────────────────────────────────────────────────
@@ -205,6 +237,9 @@ var int   wins    = 0
 var int   losses  = 0
 var int   lastSig = 0
 var int   lastSigBar = na
+var int   canRe   = 0      // 1 = long-herinstap mogelijk, -1 = short
+var int   reCount = 0
+var float posQty  = na
 
 // 1) bestaande positie: stop of TP geraakt? (bij beide in één candle: conservatief de stop)
 bool  exitHit = false
@@ -225,6 +260,8 @@ else if posDir == -1
         exitPx  := tpPx
 
 if exitHit
+    if exitPx == slPx   // gestopt (niet via TP) → herinstap mogelijk
+        canRe := posDir
     float pnl = posDir * (exitPx / entryPx - 1) * 100
     if pnl > 0
         wins += 1
@@ -244,9 +281,27 @@ else if useTrail and posDir == -1
     extPx := math.min(extPx, low)
     slPx  := math.min(slPx, extPx + atr * trailMult)
 
-// 2) nieuw signaal (sluit een tegengestelde positie op de slotkoers)
+// 2) herinstap na stop-out zolang de trend intact is
 if buySignal or sellSignal
-    int newDir = buySignal ? 1 : -1
+    canRe   := 0
+    reCount := 0
+bool closeUpFast = close > emaFast and close[1] <= emaFast[1]
+bool closeDnFast = close < emaFast and close[1] >= emaFast[1]
+bool reBuy  = useReEntry and barstate.isconfirmed and posDir == 0 and canRe == 1 and reCount < reMax and
+     closeUpFast and emaMid > emaLong and close > emaLong and (not htfActive or htfTrend == 1) and btcTrend >= 0 and
+     diPlus > diMinus and (not useRsi or rsi < rsiOB) and not buySignal and not sellSignal
+bool reSell = useReEntry and barstate.isconfirmed and posDir == 0 and canRe == -1 and reCount < reMax and
+     closeDnFast and emaMid < emaLong and close < emaLong and (not htfActive or htfTrend == -1) and btcTrend <= 0 and
+     diMinus > diPlus and (not useRsi or rsi > rsiOS) and not buySignal and not sellSignal
+if (canRe == 1 and emaMid < emaLong) or (canRe == -1 and emaMid > emaLong)
+    canRe := 0   // trend gebroken
+
+// 3) nieuw signaal of herinstap (sluit een tegengestelde positie op de slotkoers)
+if buySignal or sellSignal or reBuy or reSell
+    int  newDir = buySignal or reBuy ? 1 : -1
+    bool isRe   = reBuy or reSell
+    if isRe
+        reCount += 1
     if posDir == -newDir
         bool won = posDir == 1 ? close > entryPx : close < entryPx
         if won
@@ -259,14 +314,18 @@ if buySignal or sellSignal
         slPx    := close - newDir * atr * slMult
         tpPx    := useTrail ? na : close + newDir * atr * tpMult
         extPx   := close
+        // positiegrootte: risico / stopafstand, begrensd door max. hefboom
+        float stopDist = math.abs(close - slPx)
+        posQty  := stopDist > 0 ? math.min(accSize * riskPct / 100 / stopDist, maxLev * accSize / close) : na
     lastSig    := newDir
     lastSigBar := bar_index
     if showLabels
-        string txt = (buySignal ? "BUY" : "SELL") + "\n" + (score > 0 ? "+" : "") + str.tostring(score) + "/" + str.tostring(maxScore)
+        string sizeTxt = showSize and not na(posQty) ? "\n" + fmtQty(posQty) + " " + syminfo.basecurrency + " • " + str.tostring(riskPct, "#.##") + "%" : ""
+        string txt = (isRe ? "RE-" : "") + (newDir == 1 ? "BUY" : "SELL") + "\n" + (score > 0 ? "+" : "") + str.tostring(score) + "/" + str.tostring(maxScore) + sizeTxt
         label.new(bar_index, close, txt,
-             yloc = buySignal ? yloc.belowbar : yloc.abovebar,
-             style = buySignal ? label.style_label_up : label.style_label_down,
-             color = buySignal ? colBull : colBear, textcolor = color.white, size = size.small)
+             yloc = newDir == 1 ? yloc.belowbar : yloc.abovebar,
+             style = newDir == 1 ? label.style_label_up : label.style_label_down,
+             color = color.new(newDir == 1 ? colBull : colBear, isRe ? 35 : 0), textcolor = color.white, size = isRe ? size.tiny : size.small)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LIQUIDATIES
@@ -367,9 +426,13 @@ alertcondition(trendState <= -1 and trendState[1] > -1, "Trend wordt bearish", "
 alertcondition(longLiq,  "Long-liquidaties",  "TrendNav: {{ticker}} long-liquidatiegolf (OI-daling + rode candle) @ {{close}}")
 alertcondition(shortLiq, "Short-liquidaties", "TrendNav: {{ticker}} short-squeeze (OI-daling + groene candle) @ {{close}}")
 
-if buySignal or sellSignal
-    alert((buySignal ? "BUY " : "SELL ") + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
+alertcondition(reBuy,  "TrendNav RE-BUY",  "TrendNav RE-BUY (herinstap) {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(reSell, "TrendNav RE-SELL", "TrendNav RE-SELL (herinstap) {{ticker}} ({{interval}}) @ {{close}}")
+
+if buySignal or sellSignal or reBuy or reSell
+    alert((reBuy or reSell ? "RE-" : "") + (buySignal or reBuy ? "BUY " : "SELL ") + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
          " | stop " + str.tostring(slPx, format.mintick) + (useTrail ? " (trailing)" : " | TP " + str.tostring(tpPx, format.mintick)) +
+         (showSize and not na(posQty) ? " | grootte " + fmtQty(posQty) + " " + syminfo.basecurrency + " (" + str.tostring(riskPct, "#.##") + "% risico)" : "") +
          " | score " + str.tostring(score) + "/" + str.tostring(maxScore) + " | ADX " + str.tostring(adx, "#.0"),
          alert.freq_once_per_bar_close)
 
@@ -399,7 +462,7 @@ setRow(table t, int row, string k, string v, color vCol, color vBg) =>
     table.cell(t, 0, row, k, text_color = keyCol, text_size = txtSize, text_halign = text.align_left, bgcolor = tblBg)
     table.cell(t, 1, row, v, text_color = vCol,   text_size = txtSize, text_halign = text.align_center, bgcolor = vBg)
 
-var table dash = table.new(tablePosition(tablePosIn), 2, 14, bgcolor = tblBg, border_color = color.new(color.gray, 70), border_width = 1, frame_color = color.new(color.gray, 50), frame_width = 1)
+var table dash = table.new(tablePosition(tablePosIn), 2, 16, bgcolor = tblBg, border_color = color.new(color.gray, 70), border_width = 1, frame_color = color.new(color.gray, 50), frame_width = 1)
 
 if showTable and barstate.islast
     color up = colBull
@@ -470,4 +533,13 @@ if showTable and barstate.islast
                 nearDn := lp
     string upTxt = na(nearUp) ? "—" : "↑ " + str.tostring(nearUp, format.mintick) + " (+" + str.tostring((nearUp / close - 1) * 100, "#.0") + "%)"
     string dnTxt = na(nearDn) ? "—" : "↓ " + str.tostring(nearDn, format.mintick) + " (" + str.tostring((nearDn / close - 1) * 100, "#.0") + "%)"
+    // BTC-filter
+    string bTxt = not useBtc ? "uit" : isBtc ? "n.v.t. (BTC)" : btcTrend == 1 ? "BTC BULLISH" : btcTrend == -1 ? "BTC BEARISH" : "BTC NEUTRAAL"
+    setRow(dash, 14, "BTC-filter", bTxt, btcTrend == 1 ? up : btcTrend == -1 ? dn : nt, tblBg)
+
+    // Positiegrootte
+    string szTxt = posDir != 0 and not na(posQty) ? fmtQty(posQty) + " " + syminfo.basecurrency + "  •  " + str.tostring(posQty * entryPx / accSize, "#.##") + "x" :
+         "per signaal: " + str.tostring(riskPct, "#.##") + "% = " + str.tostring(accSize * riskPct / 100, "#,###") + " " + syminfo.currency
+    setRow(dash, 15, "Positiegrootte", szTxt, posDir == 0 ? nt : color.white, tblBg)
+
     setRow(dash, 13, "Liq-niveaus", showLiqLvl ? upTxt + "  " + dnTxt : "uit", nt, tblBg)
