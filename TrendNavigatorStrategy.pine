@@ -1,0 +1,160 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TREND NAVIGATOR — STRATEGY (backtest-versie van TrendNavigator.pine)
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Zelfde signaallogica als de indicator, maar met echte orders zodat je in de
+//  Strategy Tester winstfactor, drawdown, aantal trades enz. ziet.
+//
+//  • Entry op de open van de candle ná het signaal (realistisch)
+//  • Start-stop = 2× ATR, daarna trailing stop op 3× ATR van de hoogste high /
+//    laagste low sinds entry (of optioneel een vaste TP)
+//  • Tegengesteld signaal = omdraaien (of alleen sluiten bij "Alleen long")
+//  • Kosten: 0,07% per kant (0,05% fee + ~0,02% slippage)
+//
+//  Aanbevolen: 4H-chart, BTC / ETH / SOL / HYPE (USDT-perp of spot).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//@version=6
+strategy("Trend Navigator Strategy", shorttitle = "TrendNav-S", overlay = true,
+     initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100,
+     commission_type = strategy.commission.percent, commission_value = 0.07, pyramiding = 0,
+     calc_on_every_tick = false, process_orders_on_close = false)
+
+// ─── Instellingen (zelfde standaardwaarden als de indicator) ───────────────────
+grpEma = "EMA's"
+lenFast = input.int(9,   "Snelle EMA", minval = 1, group = grpEma, inline = "lint")
+lenSlow = input.int(21,  "Trage EMA",  minval = 1, group = grpEma, inline = "lint")
+lenMid  = input.int(50,  "Trend EMA",  minval = 1, group = grpEma, inline = "trend")
+lenLong = input.int(200, "Lange EMA",  minval = 1, group = grpEma, inline = "trend")
+
+grpSig = "Signalen"
+sigWindow     = input.int(3, "Bevestigingsvenster na cross (bars)", minval = 0, maxval = 20, group = grpSig)
+useLongFilter = input.bool(true, "Alleen long boven / short onder lange EMA", group = grpSig)
+useRsi        = input.bool(true, "RSI-filter", group = grpSig)
+rsiLen        = input.int(14, "RSI lengte", minval = 1, group = grpSig, inline = "rsi")
+rsiOB         = input.float(70, "OB", group = grpSig, inline = "rsi")
+rsiOS         = input.float(30, "OS", group = grpSig, inline = "rsi")
+longOnly      = input.bool(false, "Alleen long (SELL = sluiten)", group = grpSig)
+
+grpAdx = "ADX / DMI"
+diLen     = input.int(14, "DI lengte", minval = 1, group = grpAdx, inline = "adx")
+adxSmooth = input.int(14, "ADX smoothing", minval = 1, group = grpAdx, inline = "adx")
+adxMin    = input.float(15, "Min. ADX", minval = 0, step = 0.5, group = grpAdx)
+useAdxUp  = input.bool(false, "ADX moet stijgen", group = grpAdx)
+
+grpVol = "Volume"
+useVol  = input.bool(true, "Volume-filter", group = grpVol)
+volLen  = input.int(20, "Volume gemiddelde", minval = 1, group = grpVol)
+volMult = input.float(1.0, "Min. relatief volume", minval = 0, step = 0.1, group = grpVol)
+
+grpHtf = "Hogere timeframe"
+useHtf = input.bool(true, "HTF-trendfilter", group = grpHtf)
+htf    = input.timeframe("D", "HTF timeframe", group = grpHtf)
+
+grpRisk = "Risico (ATR)"
+exitMode  = input.string("Trailing stop", "Exit-methode", options = ["Trailing stop", "Vaste TP"], group = grpRisk)
+atrLen    = input.int(14, "ATR lengte", minval = 1, group = grpRisk)
+slMult    = input.float(2.0, "Start-stop (x ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+trailMult = input.float(3.0, "Trailing afstand (x ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+tpMult    = input.float(3.0, "Take-profit (x ATR, alleen Vaste TP)", minval = 0.1, step = 0.1, group = grpRisk)
+bool useTrail = exitMode == "Trailing stop"
+
+grpDate = "Periode"
+useDate   = input.bool(false, "Alleen vanaf startdatum", group = grpDate)
+startDate = input.time(timestamp("2023-01-01T00:00:00"), "Startdatum", group = grpDate)
+bool inDate = not useDate or time >= startDate
+
+// ─── Berekeningen ──────────────────────────────────────────────────────────────
+emaFast = ta.ema(close, lenFast)
+emaSlow = ta.ema(close, lenSlow)
+emaLong = ta.ema(close, lenLong)
+[diPlus, diMinus, adx] = ta.dmi(diLen, adxSmooth)
+rsi = ta.rsi(close, rsiLen)
+atr = ta.atr(atrLen)
+
+bool  hasVolume = ta.cum(nz(volume)) > 0
+float volAvg    = ta.sma(nz(volume), volLen)
+float relVol    = hasVolume and volAvg > 0 ? nz(volume) / volAvg : na
+
+htfTrendCalc() =>
+    float e1 = ta.ema(close, lenMid)
+    float e2 = ta.ema(close, lenLong)
+    int   t  = close > e1 and e1 > e2 ? 1 : close < e1 and e1 < e2 ? -1 : 0
+    t[1]
+
+bool htfValid   = timeframe.in_seconds(htf) >= timeframe.in_seconds(timeframe.period)
+int  htfTrendRq = request.security(syminfo.tickerid, htf, htfTrendCalc(), lookahead = barmerge.lookahead_on)
+bool htfActive  = useHtf and htfValid
+int  htfTrend   = htfActive ? nz(htfTrendRq) : 0
+
+// ─── Signalen ──────────────────────────────────────────────────────────────────
+bool crossUp = ta.crossover(emaFast, emaSlow)
+bool crossDn = ta.crossunder(emaFast, emaSlow)
+bool bullSetup = nz(ta.barssince(crossUp), 9999) <= sigWindow and emaFast > emaSlow
+bool bearSetup = nz(ta.barssince(crossDn), 9999) <= sigWindow and emaFast < emaSlow
+
+bool adxOk = adx >= adxMin and (not useAdxUp or adx > adx[1])
+bool volOk = not useVol or not hasVolume or nz(relVol) >= volMult
+
+bool longOk  = adxOk and volOk and diPlus > diMinus and
+     (not useLongFilter or close > emaLong) and (not htfActive or htfTrend >= 0) and (not useRsi or rsi < rsiOB)
+bool shortOk = adxOk and volOk and diMinus > diPlus and
+     (not useLongFilter or close < emaLong) and (not htfActive or htfTrend <= 0) and (not useRsi or rsi > rsiOS)
+
+var bool usedUp = false
+var bool usedDn = false
+if crossUp
+    usedUp := false
+if crossDn
+    usedDn := false
+bool buySignal  = bullSetup and longOk  and not usedUp
+bool sellSignal = bearSetup and shortOk and not usedDn
+if buySignal
+    usedUp := true
+if sellSignal
+    usedDn := true
+
+// ─── Orders ────────────────────────────────────────────────────────────────────
+var float longStop  = na
+var float shortStop = na
+var float longTp    = na
+var float shortTp   = na
+var float extPx     = na
+
+// trailing stop bijwerken zolang we in een positie zitten
+if useTrail and strategy.position_size > 0
+    extPx    := math.max(extPx, high)
+    longStop := math.max(longStop, extPx - atr * trailMult)
+else if useTrail and strategy.position_size < 0
+    extPx     := math.min(extPx, low)
+    shortStop := math.min(shortStop, extPx + atr * trailMult)
+
+if inDate and buySignal and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long)
+    longStop := close - atr * slMult
+    longTp   := useTrail ? na : close + atr * tpMult
+    extPx    := close
+else if inDate and sellSignal
+    if longOnly
+        strategy.close("Long", comment = "SELL")
+    else if strategy.position_size >= 0
+        strategy.entry("Short", strategy.short)
+        shortStop := close + atr * slMult
+        shortTp   := useTrail ? na : close - atr * tpMult
+        extPx     := close
+
+strategy.exit("XL", "Long",  stop = longStop,  limit = longTp,  comment_loss = "stop", comment_profit = "exit +")
+strategy.exit("XS", "Short", stop = shortStop, limit = shortTp, comment_loss = "stop", comment_profit = "exit +")
+
+// ─── Plots ─────────────────────────────────────────────────────────────────────
+color ribCol = emaFast > emaSlow ? color.new(#00C853, 0) : color.new(#FF1744, 0)
+p1 = plot(emaFast, "EMA snel",  color = ribCol)
+p2 = plot(emaSlow, "EMA traag", color = ribCol)
+fill(p1, p2, color = color.new(ribCol, 75))
+plot(emaLong, "EMA lang", color = color.new(#7E57C2, 0), linewidth = 2)
+float curStop = strategy.position_size > 0 ? longStop : strategy.position_size < 0 ? shortStop : na
+float curTp   = strategy.position_size > 0 ? longTp   : strategy.position_size < 0 ? shortTp   : na
+plot(curStop, "Stop", color = color.new(#FF1744, 0), style = plot.style_linebr, linewidth = 2)
+plot(useTrail ? na : curTp, "TP", color = color.new(#00C853, 0), style = plot.style_linebr)

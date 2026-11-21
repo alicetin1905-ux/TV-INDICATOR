@@ -1,0 +1,3 @@
+backtest/data/
+backtest/*.pkl
+__pycache__/

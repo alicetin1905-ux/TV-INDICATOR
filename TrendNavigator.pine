@@ -8,10 +8,14 @@
 //   • Candlekleur   = trendtoestand (groen = bull, rood = bear, grijs = geen trend)
 //   • EMA-lint 9/21 = korte-termijn richting, EMA 50/200 = hoofdtrend
 //   • BUY / SELL    = EMA-cross bevestigd door ADX, volume, EMA 200, HTF en RSI
-//   • SL / TP       = ATR-gebaseerde stop en doel na elk signaal
-//   • Dashboard     = alle componenten + trendscore + signaalstatistiek
+//   • Stop          = ATR-trailing stop (of vaste SL/TP) na elk signaal
+//   • Dashboard     = alle componenten + trendscore + positie + statistiek
 //
 //  Signalen worden pas bij het sluiten van de candle gegeven (geen repaint).
+//
+//  Standaardinstellingen zijn gebacktest op BTC, ETH, SOL en HYPE (OKX, 4H,
+//  2022–2026, incl. kosten) met train/test-split. Beste timeframe: 4H.
+//  Zie README.md en TrendNavigatorStrategy.pine voor de backtest.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 //@version=6
@@ -40,7 +44,7 @@ rsiOS         = input.float(30, "OS", minval = 0,  maxval = 50,  group = grpSig,
 grpAdx = "ADX / DMI (trendsterkte)"
 diLen     = input.int(14, "DI lengte", minval = 1, group = grpAdx, inline = "adx")
 adxSmooth = input.int(14, "ADX smoothing", minval = 1, group = grpAdx, inline = "adx")
-adxMin    = input.float(20, "Min. ADX (trend aanwezig)", minval = 0, step = 0.5, group = grpAdx,
+adxMin    = input.float(15, "Min. ADX (trend aanwezig)", minval = 0, step = 0.5, group = grpAdx,
      tooltip = "Onder deze waarde is de markt zijwaarts: candles worden grijs en er komen geen signalen.")
 adxStrong = input.float(30, "Sterke trend vanaf", minval = 0, step = 0.5, group = grpAdx)
 useAdxUp  = input.bool(false, "ADX moet stijgen voor signaal", group = grpAdx)
@@ -49,18 +53,23 @@ grpVol = "Volume"
 useVol  = input.bool(true, "Volume-filter gebruiken", group = grpVol,
      tooltip = "Wordt automatisch overgeslagen op symbolen zonder volumedata (bv. forex bij sommige brokers).")
 volLen  = input.int(20, "Volume gemiddelde (bars)", minval = 1, group = grpVol)
-volMult = input.float(1.2, "Min. relatief volume (x gemiddelde)", minval = 0, step = 0.1, group = grpVol)
+volMult = input.float(1.0, "Min. relatief volume (x gemiddelde)", minval = 0, step = 0.1, group = grpVol)
 
 grpHtf = "Hogere timeframe (HTF)"
 useHtf = input.bool(true, "HTF-trendfilter gebruiken", group = grpHtf,
      tooltip = "Geen BUY als de hogere timeframe bearish is, geen SELL als die bullish is. Werkt alleen als HTF ≥ chart-timeframe.")
-htf    = input.timeframe("240", "HTF timeframe", group = grpHtf)
+htf    = input.timeframe("D", "HTF timeframe", group = grpHtf, tooltip = "Vuistregel: ±6× de chart-timeframe. 4H-chart → D, 1H-chart → 4H.")
 
 grpRisk = "Risico (ATR)"
-showSlTp = input.bool(true, "Toon SL / TP lijnen", group = grpRisk)
-atrLen   = input.int(14, "ATR lengte", minval = 1, group = grpRisk)
-slMult   = input.float(1.5, "Stop-loss (x ATR)", minval = 0.1, step = 0.1, group = grpRisk)
-tpMult   = input.float(3.0, "Take-profit (x ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+showSlTp  = input.bool(true, "Toon stop / TP lijnen", group = grpRisk)
+exitMode  = input.string("Trailing stop", "Exit-methode", options = ["Trailing stop", "Vaste TP"], group = grpRisk,
+     tooltip = "Trailing stop laat winnaars doorlopen (beste resultaat in de backtest). Vaste TP sluit op een vast ATR-doel.")
+atrLen    = input.int(14, "ATR lengte", minval = 1, group = grpRisk)
+slMult    = input.float(2.0, "Start-stop (x ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+trailMult = input.float(3.0, "Trailing afstand (x ATR)", minval = 0.1, step = 0.1, group = grpRisk,
+     tooltip = "Afstand van de stop tot de hoogste high (long) / laagste low (short) sinds entry.")
+tpMult    = input.float(3.0, "Take-profit (x ATR, alleen bij Vaste TP)", minval = 0.1, step = 0.1, group = grpRisk)
+bool useTrail = exitMode == "Trailing stop"
 
 grpVis = "Weergave"
 colBull    = input.color(#00C853, "Bull", group = grpVis, inline = "col")
@@ -172,36 +181,49 @@ var int   posDir  = 0
 var float entryPx = na
 var float slPx    = na
 var float tpPx    = na
+var float extPx   = na
 var int   wins    = 0
 var int   losses  = 0
 var int   lastSig = 0
 var int   lastSigBar = na
 
-// 1) bestaande positie: SL/TP geraakt? (bij beide in één candle: conservatief SL)
-bool tpHit = false
-bool slHit = false
+// 1) bestaande positie: stop of TP geraakt? (bij beide in één candle: conservatief de stop)
+bool  exitHit = false
+float exitPx  = na
 if posDir == 1
     if low <= slPx
-        slHit := true
-    else if high >= tpPx
-        tpHit := true
+        exitHit := true
+        exitPx  := slPx
+    else if not useTrail and high >= tpPx
+        exitHit := true
+        exitPx  := tpPx
 else if posDir == -1
     if high >= slPx
-        slHit := true
-    else if low <= tpPx
-        tpHit := true
+        exitHit := true
+        exitPx  := slPx
+    else if not useTrail and low <= tpPx
+        exitHit := true
+        exitPx  := tpPx
 
-if tpHit or slHit
-    if tpHit
+if exitHit
+    float pnl = posDir * (exitPx / entryPx - 1) * 100
+    if pnl > 0
         wins += 1
     else
         losses += 1
     if showSlTp
-        label.new(bar_index, posDir == 1 ? (tpHit ? high : low) : (tpHit ? low : high),
-             tpHit ? "TP ✓" : "SL ✗",
-             style = posDir == 1 ? (tpHit ? label.style_label_down : label.style_label_up) : (tpHit ? label.style_label_up : label.style_label_down),
-             color = color.new(tpHit ? colBull : colBear, 30), textcolor = color.white, size = size.tiny)
+        label.new(bar_index, exitPx, "EXIT " + (pnl > 0 ? "+" : "") + str.tostring(pnl, "#.0") + "%",
+             style = posDir == 1 ? label.style_label_upper_left : label.style_label_lower_left,
+             color = color.new(pnl > 0 ? colBull : colBear, 30), textcolor = color.white, size = size.tiny)
     posDir := 0
+
+// trailing stop bijwerken (geldt vanaf de volgende candle)
+if useTrail and posDir == 1
+    extPx := math.max(extPx, high)
+    slPx  := math.max(slPx, extPx - atr * trailMult)
+else if useTrail and posDir == -1
+    extPx := math.min(extPx, low)
+    slPx  := math.min(slPx, extPx + atr * trailMult)
 
 // 2) nieuw signaal (sluit een tegengestelde positie op de slotkoers)
 if buySignal or sellSignal
@@ -212,10 +234,12 @@ if buySignal or sellSignal
             wins += 1
         else
             losses += 1
-    posDir     := newDir
-    entryPx    := close
-    slPx       := close - newDir * atr * slMult
-    tpPx       := close + newDir * atr * tpMult
+    if posDir != newDir   // al in dezelfde richting? dan positie (en stop) behouden
+        posDir  := newDir
+        entryPx := close
+        slPx    := close - newDir * atr * slMult
+        tpPx    := useTrail ? na : close + newDir * atr * tpMult
+        extPx   := close
     lastSig    := newDir
     lastSigBar := bar_index
     if showLabels
@@ -237,8 +261,8 @@ plot(showMidLong ? emaMid  : na, "EMA trend", color = color.new(#FF9800, 0), lin
 plot(showMidLong ? emaLong : na, "EMA lang",  color = color.new(#7E57C2, 0), linewidth = 3)
 
 bool showPos = showSlTp and posDir != 0
-plot(showPos ? slPx    : na, "Stop-loss",   color = color.new(colBear, 0), style = plot.style_linebr, linewidth = 1)
-plot(showPos ? tpPx    : na, "Take-profit", color = color.new(colBull, 0), style = plot.style_linebr, linewidth = 1)
+plot(showPos ? slPx    : na, "Stop",        color = color.new(colBear, 0), style = plot.style_linebr, linewidth = 2)
+plot(showPos and not useTrail ? tpPx : na, "Take-profit", color = color.new(colBull, 0), style = plot.style_linebr, linewidth = 1)
 plot(showPos ? entryPx : na, "Entry",       color = color.new(colNeutral, 30), style = plot.style_linebr, linewidth = 1)
 
 barcolor(colorBars ? trendCol : na, title = "Trendkleur candles")
@@ -254,7 +278,7 @@ alertcondition(trendState <= -1 and trendState[1] > -1, "Trend wordt bearish", "
 
 if buySignal or sellSignal
     alert((buySignal ? "BUY " : "SELL ") + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
-         " | SL " + str.tostring(slPx, format.mintick) + " | TP " + str.tostring(tpPx, format.mintick) +
+         " | stop " + str.tostring(slPx, format.mintick) + (useTrail ? " (trailing)" : " | TP " + str.tostring(tpPx, format.mintick)) +
          " | score " + str.tostring(score) + "/" + str.tostring(maxScore) + " | ADX " + str.tostring(adx, "#.0"),
          alert.freq_once_per_bar_close)
 
@@ -284,7 +308,7 @@ setRow(table t, int row, string k, string v, color vCol, color vBg) =>
     table.cell(t, 0, row, k, text_color = keyCol, text_size = txtSize, text_halign = text.align_left, bgcolor = tblBg)
     table.cell(t, 1, row, v, text_color = vCol,   text_size = txtSize, text_halign = text.align_center, bgcolor = vBg)
 
-var table dash = table.new(tablePosition(tablePosIn), 2, 10, bgcolor = tblBg, border_color = color.new(color.gray, 70), border_width = 1, frame_color = color.new(color.gray, 50), frame_width = 1)
+var table dash = table.new(tablePosition(tablePosIn), 2, 11, bgcolor = tblBg, border_color = color.new(color.gray, 70), border_width = 1, frame_color = color.new(color.gray, 50), frame_width = 1)
 
 if showTable and barstate.islast
     color up = colBull
@@ -334,3 +358,8 @@ if showTable and barstate.islast
     string sigTxt = lastSig == 0 ? "—" : (lastSig == 1 ? "BUY" : "SELL") + " • " + str.tostring(bar_index - lastSigBar) + " bars"
     string stTxt  = total > 0 ? "  |  " + str.tostring(100.0 * wins / total, "#") + "% (" + str.tostring(wins) + "/" + str.tostring(total) + ")" : ""
     setRow(dash, 9, "Signaal | hit-rate", sigTxt + stTxt, lastSig == 1 ? up : lastSig == -1 ? dn : nt, tblBg)
+
+    // Open positie
+    float  openPnl = posDir != 0 ? posDir * (close / entryPx - 1) * 100 : na
+    string posTxt  = posDir == 0 ? "geen" : (posDir == 1 ? "LONG " : "SHORT ") + (openPnl > 0 ? "+" : "") + str.tostring(openPnl, "#.0") + "%  •  stop " + str.tostring(slPx, format.mintick)
+    setRow(dash, 10, "Positie", posTxt, posDir == 0 ? nt : openPnl > 0 ? up : dn, tblBg)
