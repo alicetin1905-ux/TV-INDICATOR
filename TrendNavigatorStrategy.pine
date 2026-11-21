@@ -63,6 +63,11 @@ atrLen    = input.int(14, "ATR lengte", minval = 1, group = grpRisk)
 slMult    = input.float(2.0, "Start-stop (x ATR)", minval = 0.1, step = 0.1, group = grpRisk)
 trailMult = input.float(3.0, "Trailing afstand (x ATR)", minval = 0.1, step = 0.1, group = grpRisk)
 tpMult    = input.float(3.0, "Take-profit (x ATR, alleen Vaste TP)", minval = 0.1, step = 0.1, group = grpRisk)
+usePartial = input.bool(false, "Deels winst nemen (TP1)", group = grpRisk,
+     tooltip = "Backtest: verlaagt het rendement op alle munten zonder de drawdown te verlagen. Standaard uit.")
+ptR        = input.float(2.0, "TP1 op (x R)", minval = 0.5, step = 0.5, group = grpRisk, inline = "pt")
+ptFrac     = input.float(50, "deel (%)", minval = 5, maxval = 95, step = 5, group = grpRisk, inline = "pt")
+ptBE       = input.bool(true, "Stop naar break-even na TP1", group = grpRisk)
 bool useTrail = exitMode == "Trailing stop"
 
 grpRe = "Herinstap & BTC-filter"
@@ -149,11 +154,23 @@ var float shortTp   = na
 var float extPx     = na
 var int   canRe     = 0
 var int   reCount   = 0
+var float longTp1   = na
+var float shortTp1  = na
+var bool  tp1Done   = false
 
 // 1) gestopt (niet omgedraaid)? → herinstap mogelijk
 if strategy.position_size == 0 and strategy.position_size[1] != 0 and strategy.closedtrades > 0
     if strategy.closedtrades.exit_comment(strategy.closedtrades - 1) == "stop"
         canRe := strategy.position_size[1] > 0 ? 1 : -1
+
+// TP1 gevuld? (positie kleiner geworden, zelfde richting) → evt. stop naar break-even
+if not tp1Done and strategy.position_size != 0 and math.sign(strategy.position_size) == math.sign(strategy.position_size[1]) and
+     math.abs(strategy.position_size) < math.abs(strategy.position_size[1])
+    tp1Done := true
+    if ptBE and strategy.position_size > 0
+        longStop := math.max(longStop, strategy.position_avg_price)
+    else if ptBE and strategy.position_size < 0
+        shortStop := math.min(shortStop, strategy.position_avg_price)
 
 // 2) trailing stop bijwerken zolang we in een positie zitten
 if useTrail and strategy.position_size > 0
@@ -188,6 +205,8 @@ if inDate and (buySignal or reBuy) and strategy.position_size <= 0
     strategy.entry("Long", strategy.long, qty = calcQty(), comment = reBuy ? "RE-BUY" : "BUY")
     longStop := close - atr * slMult
     longTp   := useTrail ? na : close + atr * tpMult
+    longTp1  := close + ptR * atr * slMult
+    tp1Done  := false
     extPx    := close
     if reBuy
         reCount += 1
@@ -198,10 +217,15 @@ else if inDate and (sellSignal or reSell)
         strategy.entry("Short", strategy.short, qty = calcQty(), comment = reSell ? "RE-SELL" : "SELL")
         shortStop := close + atr * slMult
         shortTp   := useTrail ? na : close - atr * tpMult
+        shortTp1  := close - ptR * atr * slMult
+        tp1Done   := false
         extPx     := close
         if reSell
             reCount += 1
 
+if usePartial and not tp1Done
+    strategy.exit("TP1L", "Long",  qty_percent = ptFrac, limit = longTp1,  stop = longStop,  comment_loss = "stop", comment_profit = "TP1")
+    strategy.exit("TP1S", "Short", qty_percent = ptFrac, limit = shortTp1, stop = shortStop, comment_loss = "stop", comment_profit = "TP1")
 strategy.exit("XL", "Long",  stop = longStop,  limit = longTp,  comment_loss = "stop", comment_profit = "TP")
 strategy.exit("XS", "Short", stop = shortStop, limit = shortTp, comment_loss = "stop", comment_profit = "TP")
 

@@ -73,6 +73,11 @@ slMult    = input.float(2.0, "Start-stop (x ATR)", minval = 0.1, step = 0.1, gro
 trailMult = input.float(3.0, "Trailing afstand (x ATR)", minval = 0.1, step = 0.1, group = grpRisk,
      tooltip = "Afstand van de stop tot de hoogste high (long) / laagste low (short) sinds entry.")
 tpMult    = input.float(3.0, "Take-profit (x ATR, alleen bij Vaste TP)", minval = 0.1, step = 0.1, group = grpRisk)
+usePartial = input.bool(false, "Deels winst nemen (TP1)", group = grpRisk,
+     tooltip = "Neemt een deel winst op X keer het risico (R = afstand entry → start-stop). Backtest: verlaagt het rendement op alle munten (BTC +97% → +48% bij 50% op 2R) zonder de drawdown te verlagen. Alleen voor wie een hogere winrate prettiger vindt.")
+ptR        = input.float(2.0, "TP1 op (x R)", minval = 0.5, step = 0.5, group = grpRisk, inline = "pt")
+ptFrac     = input.float(50, "deel (%)", minval = 5, maxval = 95, step = 5, group = grpRisk, inline = "pt")
+ptBE       = input.bool(true, "Stop naar break-even na TP1", group = grpRisk)
 bool useTrail = exitMode == "Trailing stop"
 
 grpRe = "Herinstap & BTC-filter"
@@ -240,6 +245,9 @@ var int   lastSigBar = na
 var int   canRe   = 0      // 1 = long-herinstap mogelijk, -1 = short
 var int   reCount = 0
 var float posQty  = na
+var bool  ptDone  = false   // TP1 al genomen?
+var float ptRet   = 0.0     // rendement van het TP1-deel
+var float rDist   = na      // R = afstand entry → start-stop
 
 // 1) bestaande positie: stop of TP geraakt? (bij beide in één candle: conservatief de stop)
 bool  exitHit = false
@@ -263,6 +271,8 @@ if exitHit
     if exitPx == slPx   // gestopt (niet via TP) → herinstap mogelijk
         canRe := posDir
     float pnl = posDir * (exitPx / entryPx - 1) * 100
+    if ptDone   // gewogen met het eerder genomen TP1-deel
+        pnl := ptFrac / 100 * ptRet + (1 - ptFrac / 100) * pnl
     if pnl > 0
         wins += 1
     else
@@ -272,6 +282,18 @@ if exitHit
              style = posDir == 1 ? label.style_label_upper_left : label.style_label_lower_left,
              color = color.new(pnl > 0 ? colBull : colBear, 30), textcolor = color.white, size = size.tiny)
     posDir := 0
+
+// TP1: deels winst nemen op ptR x R (na de stop-check: conservatief)
+float tp1Px = posDir != 0 and usePartial and not ptDone ? entryPx + posDir * ptR * rDist : na
+if not na(tp1Px) and (posDir == 1 ? high >= tp1Px : low <= tp1Px)
+    ptDone := true
+    ptRet  := posDir * (tp1Px / entryPx - 1) * 100
+    if ptBE
+        slPx := posDir == 1 ? math.max(slPx, entryPx) : math.min(slPx, entryPx)
+    if showSlTp
+        label.new(bar_index, tp1Px, "TP1 " + str.tostring(ptFrac, "#") + "% +" + str.tostring(ptRet, "#.0") + "%",
+             style = posDir == 1 ? label.style_label_lower_left : label.style_label_upper_left,
+             color = color.new(colBull, 30), textcolor = color.white, size = size.tiny)
 
 // trailing stop bijwerken (geldt vanaf de volgende candle)
 if useTrail and posDir == 1
@@ -314,6 +336,9 @@ if buySignal or sellSignal or reBuy or reSell
         slPx    := close - newDir * atr * slMult
         tpPx    := useTrail ? na : close + newDir * atr * tpMult
         extPx   := close
+        rDist   := math.abs(close - slPx)
+        ptDone  := false
+        ptRet   := 0.0
         // positiegrootte: risico / stopafstand, begrensd door max. hefboom
         float stopDist = math.abs(close - slPx)
         posQty  := stopDist > 0 ? math.min(accSize * riskPct / 100 / stopDist, maxLev * accSize / close) : na
@@ -401,6 +426,7 @@ plot(showMidLong ? emaLong : na, "EMA lang",  color = color.new(#7E57C2, 0), lin
 
 bool showPos = showSlTp and posDir != 0
 plot(showPos ? slPx    : na, "Stop",        color = color.new(colBear, 0), style = plot.style_linebr, linewidth = 2)
+plot(showPos and usePartial and not ptDone ? entryPx + posDir * ptR * rDist : na, "TP1", color = color.new(colBull, 40), style = plot.style_linebr, linewidth = 1)
 plot(showPos and not useTrail ? tpPx : na, "Take-profit", color = color.new(colBull, 0), style = plot.style_linebr, linewidth = 1)
 plot(showPos ? entryPx : na, "Entry",       color = color.new(colNeutral, 30), style = plot.style_linebr, linewidth = 1)
 
@@ -515,7 +541,7 @@ if showTable and barstate.islast
 
     // Open positie
     float  openPnl = posDir != 0 ? posDir * (close / entryPx - 1) * 100 : na
-    string posTxt  = posDir == 0 ? "geen" : (posDir == 1 ? "LONG " : "SHORT ") + (openPnl > 0 ? "+" : "") + str.tostring(openPnl, "#.0") + "%  •  stop " + str.tostring(slPx, format.mintick)
+    string posTxt  = posDir == 0 ? "geen" : (posDir == 1 ? "LONG " : "SHORT ") + (openPnl > 0 ? "+" : "") + str.tostring(openPnl, "#.0") + "%" + (ptDone ? " • TP1 ✓" : "") + "  •  stop " + str.tostring(slPx, format.mintick)
     setRow(dash, 10, "Positie", posTxt, posDir == 0 ? nt : openPnl > 0 ? up : dn, tblBg)
 
     // Open interest & liquidaties

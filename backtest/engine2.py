@@ -36,11 +36,16 @@ def run2(df, p, ind=None, htf=None, btc=None, start=0, end=None):
     pos = 0; entry = sl = tp = ext = sdist = 0.0; kind = ""
     pending = 0; pend_kind = ""
     can_re = 0; re_count = 0
+    pt_done = False; pt_ret = 0.0; r_dist = 0.0
+    ptR, ptF, ptBE = p.get("ptR", 0), p.get("ptFrac", 0.5), p.get("ptBE", False)
     trades = []
     warm = max(p["lenLong"], 50) + 5
 
     def close_trade(px):
-        trades.append((pos * (px / entry - 1) - COST, sdist, kind))
+        r = pos * (px / entry - 1)
+        if pt_done:  # deel al eerder genomen op het 2R-doel
+            r = ptF * pt_ret + (1 - ptF) * r
+        trades.append((r - COST, sdist, kind))
 
     for i in range(warm, end):
         # --- fill pending entry at open
@@ -50,6 +55,7 @@ def run2(df, p, ind=None, htf=None, btc=None, start=0, end=None):
             pos = pending; entry = o[i]; kind = pend_kind
             sl = entry - pos * atr[i - 1] * p["slMult"]
             sdist = abs(entry - sl) / entry
+            r_dist = abs(entry - sl); pt_done = False; pt_ret = 0.0
             tp = entry + pos * atr[i - 1] * p["tpMult"] if p["tpMult"] > 0 else np.nan
             ext = entry
         pending = 0
@@ -67,6 +73,13 @@ def run2(df, p, ind=None, htf=None, btc=None, start=0, end=None):
                 close_trade(tp); pos = 0
         if stopped:
             can_re = stopped
+        # --- deels winst nemen op ptR x R (na de stop-check: conservatief)
+        if ptR > 0 and pos != 0 and not pt_done:
+            tgt = entry + pos * ptR * r_dist
+            if (pos == 1 and h[i] >= tgt) or (pos == -1 and l[i] <= tgt):
+                pt_done = True; pt_ret = pos * (tgt / entry - 1)
+                if ptBE:
+                    sl = max(sl, entry) if pos == 1 else min(sl, entry)
         # --- trailing (wijder in sterke trend)
         tm = p.get("trailMult", 0)
         tb = p.get("trailBull", 0)

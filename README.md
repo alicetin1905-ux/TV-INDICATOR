@@ -29,6 +29,7 @@ De standaardinstellingen zijn **gebacktest en getoetst buiten de trainingsdata**
 | **RE-BUY / RE-SELL** (lichter, kleiner) | Herinstap na een stop-out terwijl de trend intact is |
 | **Rode stoplijn** | Start op 2× ATR en schuift mee op 3× ATR van de hoogste high (long) of laagste low (short) |
 | **EXIT +x%** | Positie gesloten door de stop, met resultaat |
+| **TP1 50% +x%** (optioneel) | Deel van de positie genomen op 2R (standaard uit) |
 | **Oranje bol onder candle** | Long-liquidatiegolf (longs gedwongen gesloten). Grotere bol = heftiger |
 | **Blauwe bol boven candle** | Short-liquidatiegolf (short squeeze) |
 | **Oranje/blauwe lijnen** | Geschatte liquidatieniveaus van 25×/50×/100× posities. Dikker = lagere hefboom. Verdwijnen zodra de koers ze raakt |
@@ -126,6 +127,7 @@ Testperiode: vanaf juni 2025 (HYPE: vanaf juli 2026). PF = profit factor (bruto 
 - **HTF 1D aan:** zelfde profit factor, lagere drawdown (SOL 32% in plaats van 46%). Deze keuze is gemaakt op de volledige periode.
 - **Herinstap** (225 varianten getest): de slechtste munt in de train-periode gaat van PF 1,05 naar 1,21. Het helpt vooral in trendjaren (BTC 2023: +15% → +30%, SOL 2023: +12% → +90%), maar kost soms iets in zijwaartse jaren (SOL 2025: +43% → +14%). Strengere varianten (ook EMA-lint of ADX vereisen, meer herinstappen) en een wijdere trailing stop in sterke trends scoorden slechter.
 - **BTC-filter:** op 4H helpt het SOL duidelijk (PF 1,27 → 1,35), ETH blijft gelijk, en HYPE verliest rendement (minder trades; HYPE beweegt minder met BTC mee). Netto beter op de slechtste munt, dus standaard aan. **Voor HYPE kun je het filter overwegen uit te zetten.** Een BTC-filter op de dag-timeframe was schadelijk (ETH PF 0,73 in train).
+- **Deels winst nemen (TP1) werkt niet** (16 varianten: 33/50% op 1R, 1,5R, 2R of 3R, met of zonder break-even). Elke variant verlaagt de profit factor en het rendement op alle munten, en de drawdown daalt nauwelijks (die komt door reeksen volle stop-outs). Voorbeeld bij 2% risico, 50% op 2R: BTC +97% → +48%, ETH +120% → +55%, SOL +74% → +49%. De winst komt van een paar grote trends; die halveer je met een deel-TP. Wel stijgt de winrate (op 1R: ±50% in plaats van 36%). Daarom zit TP1 erin als **optie die standaard uit staat** (*Risico → Deels winst nemen*).
 - **Positiegrootte op basis van risico** verlaagt de drawdown fors (SOL: 36% → 13%) terwijl het grootste deel van het rendement blijft. Rendement per eenheid drawdown verbetert op alle munten.
 
 ### Eerlijke kanttekeningen
@@ -145,6 +147,7 @@ python3 analyze.py 4H 6   # top-configs met train/test-resultaten
 python3 stress.py         # gevoeligheid + resultaten per jaar
 python3 grid2.py          # herinstap / BTC-filter / bull-trail (engine2.py)
 python3 final2.py         # per jaar + positiegrootte
+python3 partial.py        # deels winst nemen (TP1) varianten
 
 # liquidaties
 python3 fetch_oi.py && python3 fetch_liq.py
