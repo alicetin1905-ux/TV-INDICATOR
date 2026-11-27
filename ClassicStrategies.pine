@@ -1,0 +1,177 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CLASSIC STRATEGIES — 14 bekende strategieën in één script
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Zelfde regels als backtest/classic.py, zodat je de Python-resultaten in de
+//  Strategy Tester kunt controleren. Kies de strategie onder "Strategie".
+//
+//  • Signaal op de close, order op de open van de volgende candle
+//  • 100% van de equity per trade, geen hefboom
+//  • Kosten: 0,07% per kant (zoals de Python-backtest)
+//  • Tegengesteld signaal = omdraaien (of alleen sluiten bij "Alleen long")
+//
+//  Resultaten (4H, BTC/ETH/SOL/HYPE): zie backtest/results_classic.md
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//@version=6
+strategy("Classic Strategies", shorttitle = "Classic-S", overlay = true,
+     initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100,
+     commission_type = strategy.commission.percent, commission_value = 0.07, pyramiding = 0,
+     calc_on_every_tick = false, process_orders_on_close = false)
+
+S_EMA  = "EMA 9/21 cross"
+S_GC   = "Golden cross SMA 50/200"
+S_MACD = "MACD 12/26/9"
+S_ST   = "Supertrend 10/3"
+S_RSI  = "RSI 30/70 reversal"
+S_BB   = "Bollinger 20/2 reversal"
+S_DC   = "Donchian/Turtle 20/10"
+S_ICH  = "Ichimoku 9/26/52"
+S_SAR  = "Parabolic SAR"
+S_KC   = "Keltner 20/2 breakout"
+S_STO  = "Stochastic 14/3/3"
+S_HMA  = "Hull MA 55 slope"
+S_DMI  = "DMI/ADX>20"
+S_MOM  = "Momentum 12"
+
+strat    = input.string(S_KC, "Strategie", options = [S_EMA, S_GC, S_MACD, S_ST, S_RSI, S_BB, S_DC, S_ICH, S_SAR, S_KC, S_STO, S_HMA, S_DMI, S_MOM])
+longOnly = input.bool(false, "Alleen long (short-signaal = sluiten)")
+showInd  = input.bool(true, "Indicator tonen")
+
+// ─── Indicatoren (altijd op elke bar berekend) ─────────────────────────────────
+ema9  = ta.ema(close, 9)
+ema21 = ta.ema(close, 21)
+sma50  = ta.sma(close, 50)
+sma200 = ta.sma(close, 200)
+[macdLine, macdSig, macdHist] = ta.macd(close, 12, 26, 9)
+[stLine, stDir] = ta.supertrend(3, 10)
+rsi14 = ta.rsi(close, 14)
+[bbMid, bbUp, bbLo] = ta.bb(close, 20, 2)
+hh20 = ta.highest(high, 20)[1]
+ll20 = ta.lowest(low, 20)[1]
+hh10 = ta.highest(high, 10)[1]
+ll10 = ta.lowest(low, 10)[1]
+tenkan = math.avg(ta.highest(high, 9), ta.lowest(low, 9))
+kijun  = math.avg(ta.highest(high, 26), ta.lowest(low, 26))
+spanA  = math.avg(tenkan, kijun)[25]
+spanB  = math.avg(ta.highest(high, 52), ta.lowest(low, 52))[25]
+sar = ta.sar(0.02, 0.02, 0.2)
+[kcMid, kcUp, kcLo] = ta.kc(close, 20, 2, true)
+stoK = ta.sma(ta.stoch(close, high, low, 14), 3)
+stoD = ta.sma(stoK, 3)
+hma55 = ta.hma(close, 55)
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+mom0 = ta.mom(close, 12)
+mom1 = ta.mom(mom0, 1)
+
+// ─── Signalen ──────────────────────────────────────────────────────────────────
+bool le = false
+bool se = false
+bool lx = false
+bool sx = false
+
+if strat == S_EMA
+    le := ema9 > ema21
+    se := ema9 < ema21
+else if strat == S_GC
+    le := sma50 > sma200
+    se := sma50 < sma200
+else if strat == S_MACD
+    le := ta.crossover(macdLine, macdSig)
+    se := ta.crossunder(macdLine, macdSig)
+else if strat == S_ST
+    le := stDir < 0
+    se := stDir > 0
+else if strat == S_RSI
+    le := ta.crossover(rsi14, 30)
+    se := ta.crossunder(rsi14, 70)
+else if strat == S_BB
+    le := ta.crossover(close, bbLo)
+    se := ta.crossunder(close, bbUp)
+else if strat == S_DC
+    le := close > hh20
+    se := close < ll20
+    lx := close < ll10
+    sx := close > hh10
+else if strat == S_ICH
+    bool lc = tenkan > kijun and close > math.max(spanA, spanB)
+    bool sc = tenkan < kijun and close < math.min(spanA, spanB)
+    le := lc
+    se := sc
+    lx := not lc
+    sx := not sc
+else if strat == S_SAR
+    le := close > sar
+    se := close < sar
+else if strat == S_KC
+    le := ta.crossover(close, kcUp)
+    se := ta.crossunder(close, kcLo)
+else if strat == S_STO
+    le := ta.crossover(stoK, stoD) and stoK < 20
+    se := ta.crossunder(stoK, stoD) and stoK > 80
+else if strat == S_HMA
+    le := hma55 > hma55[1]
+    se := hma55 < hma55[1]
+else if strat == S_DMI
+    bool lc = diPlus > diMinus and adx > 20
+    bool sc = diMinus > diPlus and adx > 20
+    le := lc
+    se := sc
+    lx := not lc
+    sx := not sc
+else if strat == S_MOM
+    le := mom0 > 0 and mom1 > 0
+    se := mom0 < 0 and mom1 < 0
+
+// ─── Orders ────────────────────────────────────────────────────────────────────
+pos = strategy.position_size
+if le and pos <= 0
+    strategy.entry("Long", strategy.long)
+else if se and pos >= 0
+    if longOnly
+        strategy.close("Long")
+    else
+        strategy.entry("Short", strategy.short)
+else if pos > 0 and lx
+    strategy.close("Long")
+else if pos < 0 and sx
+    strategy.close("Short")
+
+// ─── Weergave ──────────────────────────────────────────────────────────────────
+float l1 = na
+float l2 = na
+float l3 = na
+if showInd
+    if strat == S_EMA
+        l1 := ema9
+        l2 := ema21
+    else if strat == S_GC
+        l1 := sma50
+        l2 := sma200
+    else if strat == S_ST
+        l1 := stLine
+    else if strat == S_BB
+        l1 := bbUp
+        l2 := bbMid
+        l3 := bbLo
+    else if strat == S_DC
+        l1 := hh20
+        l2 := ll10
+        l3 := ll20
+    else if strat == S_ICH
+        l1 := spanA
+        l2 := spanB
+        l3 := kijun
+    else if strat == S_SAR
+        l1 := sar
+    else if strat == S_KC
+        l1 := kcUp
+        l2 := kcMid
+        l3 := kcLo
+    else if strat == S_HMA
+        l1 := hma55
+plot(l1, "Lijn 1", color = color.new(color.teal, 0), style = strat == S_SAR ? plot.style_circles : plot.style_line)
+plot(l2, "Lijn 2", color = color.new(color.orange, 0))
+plot(l3, "Lijn 3", color = color.new(color.purple, 0))

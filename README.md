@@ -8,6 +8,7 @@ De standaardinstellingen zijn **gebacktest en getoetst buiten de trainingsdata**
 |---|---|
 | [`TrendNavigator.pine`](TrendNavigator.pine) | De indicator: trendkleuren, signalen, stop, dashboard en alerts |
 | [`TrendNavigatorStrategy.pine`](TrendNavigatorStrategy.pine) | Dezelfde logica als `strategy()` voor de Strategy Tester van TradingView |
+| [`ClassicStrategies.pine`](ClassicStrategies.pine) | 14 klassieke strategieën (dropdown) om te vergelijken in de Strategy Tester |
 | [`backtest/`](backtest) | Python-backtest: data ophalen, grid search, stresstest |
 
 ## Installeren
@@ -137,6 +138,20 @@ Testperiode: vanaf juni 2025 (HYPE: vanaf juli 2026). PF = profit factor (bruto 
 - HYPE heeft maar een jaar data en 23 trades, dus die cijfers zijn statistisch zwak.
 - Resultaten uit het verleden bieden geen garantie. Dit is geen financieel advies.
 
+### Vergelijking met 14 klassieke strategieën
+
+Zelfde data, kosten en train/test-split, 100% kapitaal, long+short en long-only (volledige tabel: [`backtest/results_classic.md`](backtest/results_classic.md); in TradingView: [`ClassicStrategies.pine`](ClassicStrategies.pine)). Alleen **3 van de 28 varianten** hebben op BTC, ETH én SOL een profit factor > 1 in de testperiode:
+
+| Strategie | Slechtste test-PF (BTC/ETH/SOL) | Max DD (slechtste munt) |
+|---|---|---|
+| Keltner 20/2 breakout (L+S) | 1.60 | 58% |
+| **Trend Navigator** | 1.24 | **36%** |
+| Golden cross SMA 50/200 (L+S) | 1.15 | 57% |
+
+- **Keltner-breakout** (omdraaien bij een close buiten EMA 20 ± 2× EMA(TR)) scoort de hoogste profit factor en blijft robuust bij lengte 15–40 en breedte 2–2,5. Maar de drawdown is 1,5–3× zo groot als die van Trend Navigator, en een groot deel van de winst komt van één trade (SOL sep. 2023: +319%).
+- Alle 11 andere klassiekers (EMA-cross, MACD, Supertrend, RSI, Bollinger, Donchian, Ichimoku, SAR, Stochastic, Hull, DMI, Momentum) verliezen op minstens één munt in de testperiode. RSI- en Bollinger-reversal (tegen de trend in) zijn het slechtst.
+- Long-only werkt in de train-periode (bull) beter, maar in de test-periode (munten −33% tot −52%) verliest elke long-only variant op minstens één munt.
+
 ### Zelf opnieuw draaien
 
 ```bash
@@ -148,6 +163,7 @@ python3 stress.py         # gevoeligheid + resultaten per jaar
 python3 grid2.py          # herinstap / BTC-filter / bull-trail (engine2.py)
 python3 final2.py         # per jaar + positiegrootte
 python3 partial.py        # deels winst nemen (TP1) varianten
+python3 classic.py        # 14 klassieke strategieën vs Trend Navigator
 
 # liquidaties
 python3 fetch_oi.py && python3 fetch_liq.py
